@@ -1,4 +1,8 @@
+import math
 import rasterio
+import numpy as np
+
+from scipy import ndimage as ndi
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 
 
@@ -95,3 +99,43 @@ def find_tile_for_location(boundary_dict, loc):
         if min_lon <= lon <= max_lon and min_lat <= lat <= max_lat:
             return key
     return None
+
+
+def haversine_distance(coord1, coord2):
+    """
+    Compute the great-circle distance between two GPS points using Haversine formula.
+    Coordinates must be in (lat, lon) format in degrees.
+    Returns distance in meters.
+    """
+    R = 6371000  # Radius of Earth in meters
+    lat1, lon1 = coord1
+    lat2, lon2 = coord2
+
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+
+    a = math.sin(dphi/2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+    return R * c
+
+def total_distance(gps_coords):
+    """
+    gps_coords: list of (lat, lon) tuples
+    Returns total distance in meters.
+    """
+    if len(gps_coords) < 2:
+        return 0.0
+
+    dist = 0.0
+    for i in range(len(gps_coords) - 1):
+        dist += haversine_distance(gps_coords[i], gps_coords[i+1])
+    return dist / 1000.0
+
+
+def compute_slope(dtm, cellsize=1.0):
+    dy, dx = np.gradient(dtm, cellsize)
+    slope_rad = np.arctan(np.hypot(dx, dy))
+    return np.degrees(slope_rad)

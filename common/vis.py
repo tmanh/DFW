@@ -34,7 +34,7 @@ def save_path(dsm, path, out="plot_path.jpg"):
 def save_expanded_waterway_plot(dsm, waterway_region, filename="expanded_waterway.png"):
     """Fast DSM visualization with waterway region in blue, saved using imageio."""
     # Normalize DSM to 0–255 and convert to uint8
-    dsm_normalized = (dsm - np.nanmin(dsm)) / (np.nanmax(dsm) - np.nanmin(dsm))
+    dsm_normalized = (dsm - np.min(dsm)) / (np.max(dsm) - np.min(dsm))
     dsm_img = (dsm_normalized * 255).astype(np.uint8)
 
     # Create grayscale RGB image

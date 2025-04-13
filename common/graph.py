@@ -7,7 +7,11 @@ from skimage.draw import line
 from scipy.ndimage import binary_dilation, label
 from scipy.ndimage import distance_transform_edt
 from skimage.morphology import skeletonize
-from shapely.geometry import Polygon
+from shapely.geometry import LineString, Polygon, Point
+from shapely.ops import split
+from skimage.segmentation import watershed
+from scipy import ndimage as ndi
+
 
 def dijkstra_water_cost(dsm, start, end):
     """ Dijkstra's Algorithm to find the best water flow path, using elevation cost without blocking movement. """
@@ -242,6 +246,77 @@ def mask_between_perpendicular_cuts(mask_shape, line_pixels, expand=5000):
     return mask.astype(bool)
 
 
+def perpendicular_cut_lines(centerline, length):
+    """
+    Generate two perpendicular cut lines at the start and end of a centerline.
+    """
+    def perp_line(pt1, pt2):
+        direction = np.array(pt2) - np.array(pt1)
+        direction = direction / np.linalg.norm(direction)
+        perp = np.array([-direction[1], direction[0]])
+        center = np.array(pt1)
+        p1 = center + perp * length
+        p2 = center - perp * length
+        return LineString([tuple(p1), tuple(p2)])
+
+    start_cut = perp_line(centerline[0], centerline[1])
+    end_cut = perp_line(centerline[-1], centerline[-2])
+    return start_cut, end_cut
+
+
+def clip_polygon_with_cuts(polygon, start_cut, end_cut):
+    """
+    Clip a polygon using two perpendicular cut lines (first intersection pair only).
+    """
+    parts = split(polygon, start_cut)
+    for part in parts:
+        if part.intersects(end_cut):
+            final_parts = split(part, end_cut)
+            return max(final_parts, key=lambda p: p.area) if final_parts else None
+    return None
+
+
+def watershed_clip_contour(dsm, centerline_coords, cut_length=100):
+    """
+    Watershed segmentation followed by contour clipping with perpendicular cuts.
+    """
+    centerline_mask = np.zeros_like(dsm, dtype=np.uint8)
+    pts = np.array([[int(round(x)), int(round(y))] for x, y in centerline_coords])
+    cv2.polylines(centerline_mask, [pts], isClosed=False, color=1, thickness=1)
+
+    markers = np.zeros_like(dsm, dtype=np.int32)
+    markers[centerline_mask > 0] = 2
+    markers[0, :] = markers[-1, :] = markers[:, 0] = markers[:, -1] = 1
+
+    gradient = ndi.gaussian_gradient_magnitude(dsm, sigma=1)
+    labels = watershed(gradient, markers=markers)
+    water_mask = (labels == 2).astype(np.uint8)
+
+    # Find contours
+    contours, _ = cv2.findContours(water_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return np.zeros_like(dsm, dtype=np.uint8)
+
+    # Assume largest contour is the water region
+    contour = max(contours, key=cv2.contourArea)
+    contour_poly = Polygon([tuple(pt[0]) for pt in contour])
+
+    # Create perpendicular cut lines
+    start_cut, end_cut = perpendicular_cut_lines(centerline_coords, length=cut_length)
+
+    # Clip polygon
+    clipped_poly = clip_polygon_with_cuts(contour_poly, start_cut, end_cut)
+    if clipped_poly is None:
+        return np.zeros_like(dsm, dtype=np.uint8)
+
+    # Rasterize clipped polygon
+    final_mask = np.zeros_like(dsm, dtype=np.uint8)
+    clipped_pts = np.array([[[int(x), int(y)]] for x, y in clipped_poly.exterior.coords])
+    cv2.fillPoly(final_mask, [clipped_pts], 1)
+
+    return final_mask
+
+
 def max_safe_scale(point, direction, shape):
     """
     Scale 'direction' vector from 'point' so that point + direction * scale
@@ -316,65 +391,37 @@ def expand_water_surface_from_line(dsm, flattened, line_pixels, elevation_thresh
     return final_mask & valid
 
 
-def waterway_surface_mask(raster, centerline_coords, num_samples=100, sample_length=50):
-    centerline = LineString(centerline_coords)
+def waterway_surface_mask(dsm, centerline_coords):
+    """
+    Tile-based watershed segmentation using centerline as seed.
+    Segmentation is run independently on each tile and results are merged.
+    """
 
-    boundary_points_left = []
-    boundary_points_right = []
+    """
+    Tile-based watershed segmentation using filtered and sampled centerline as seed.
+    Segmentation is run independently on each tile and results are merged.
+    """
+    markers = np.zeros(dsm.shape, dtype=np.int32)
 
-    for dist in np.linspace(0, centerline.length, num_samples):
-        point = centerline.interpolate(dist)
+    # Filter out centerline points with outlier elevations (top/bottom 5%)
+    elevations = np.array([dsm[int(round(x)), int(round(y))] for x, y in centerline_coords])
 
-        delta = 0.1
-        if dist + delta <= centerline.length:
-            next_point = centerline.interpolate(dist + delta)
-        else:
-            next_point = centerline.interpolate(dist - delta)
+    foreground, background = 2, 1
+    markers[dsm > np.mean(elevations) * 1.1] = background
 
-        tangent = np.array([next_point.x - point.x, next_point.y - point.y])
-        tangent /= np.linalg.norm(tangent)
+    for x, y in centerline_coords:
+        markers[x, y] = foreground
 
-        perp_left = np.array([-tangent[1], tangent[0]])
-        perp_right = -perp_left
+    gradient = ndi.gaussian_gradient_magnitude(dsm, sigma=1).astype(np.float32)
+    labels = watershed(gradient.astype(np.float32), markers=markers.astype(np.int32))
 
-        line_left = [point.coords[0] + perp_left * d for d in np.linspace(0, sample_length, sample_length)]
-        line_right = [point.coords[0] + perp_right * d for d in np.linspace(0, sample_length, sample_length)]
+    # Extract waterway mask (label==2)
+    waterway_mask = (labels == 2)
 
-        def sample_along_line(line):
-            values = []
-            for x, y in line:
-                xi, yi = int(round(x)), int(round(y))
-                if 0 <= xi < raster.shape[1] and 0 <= yi < raster.shape[0]:
-                    values.append(raster[yi, xi])
-                else:
-                    values.append(None)
-            return values
+    cv2.imwrite('mask.jpg', (waterway_mask * 255).astype(np.uint8))
+    cv2.imwrite('markers.jpg', (markers * 255).astype(np.uint8))
 
-        left_values = sample_along_line(line_left)
-        right_values = sample_along_line(line_right)
-
-        def detect_edge(values):
-            valid_values = np.array([v if v is not None else 0 for v in values])
-            gradients = np.abs(np.gradient(valid_values))
-            edge_idx = np.argmax(gradients)
-            return edge_idx
-
-        left_edge_idx = detect_edge(left_values)
-        right_edge_idx = detect_edge(right_values)
-
-        boundary_points_left.append(line_left[left_edge_idx])
-        boundary_points_right.append(line_right[right_edge_idx])
-
-    boundary_points_right.reverse()
-    water_surface_polygon = Polygon(boundary_points_left + boundary_points_right)
-
-    mask = np.zeros_like(raster, dtype=np.uint8)
-    polygon_points_int = np.array([[int(round(x)), int(round(y))] for x, y in water_surface_polygon.exterior.coords])
-
-    cv2.fillPoly(mask, [polygon_points_int], color=1)
-
-    return mask
-
+    return waterway_mask, (markers == foreground)
 
 
 def compute_waterway_statistics(waterway_region, skeleton, pixel_size):
@@ -412,7 +459,7 @@ def compute_waterway_statistics(waterway_region, skeleton, pixel_size):
     # Compute average and standard deviation of the widths.
     avg_width = np.mean(widths)
     std_width = np.std(widths)
-    
+
     # Compute z-scores for each skeleton pixel.
     # Avoid division by zero if std_width is zero.
     if std_width > 0:

@@ -1,0 +1,10 @@
+model:
+  target: model.mlp.MLP
+  params:
+    in_dim: 13
+    n_layers: 1
+    n_dim: 32
+    fmts: 'wo'
+
+dataset:
+  inputs: 'update'
