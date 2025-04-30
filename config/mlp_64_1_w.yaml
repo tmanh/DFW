@@ -1,0 +1,10 @@
+model:
+  target: model.mlp.MLPW
+  params:
+    in_dim: 17
+    n_layers: 2
+    n_dim: 64
+    fmts: 'wo'
+
+dataset:
+  inputs: 'update'

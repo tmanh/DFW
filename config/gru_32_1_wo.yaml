@@ -1,5 +1,5 @@
 model:
-  target: model.mlp.MLP
+  target: model.gru.GRU
   params:
     in_dim: 18
     n_layers: 1

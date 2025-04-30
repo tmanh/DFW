@@ -1,10 +1,10 @@
 model:
-  target: model.mlp.MLP
+  target: model.gnn.GATWithEdgeAttr
   params:
     in_dim: 18
     n_layers: 1
     n_dim: 32
-    fmts: 'wo'
+    fmts: 'io'
 
 dataset:
   inputs: 'update'

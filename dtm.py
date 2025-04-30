@@ -2,7 +2,9 @@ import os
 import time
 import pickle
 import numpy as np
+import gc
 
+import scipy
 from affine import Affine
 from rasterio.merge import merge
 from skimage.restoration import denoise_tv_chambolle
@@ -260,7 +262,7 @@ def refine_and_analyze_path(cropped_dtm, nodes, coarse_path, slope_deg):
     for k in slope_stats.keys():
         results[k] = slope_stats[k]
 
-    return slope_deg[flattened[-1][0], flattened[-1][1]], cropped_dtm[flattened[-1][0], flattened[-1][1]], results
+    return flattened[0], flattened[-1], results
 
 
 def slope_statistics_along_centerline(slope_map, centerline_coords):
@@ -300,7 +302,7 @@ if __name__ == "__main__":
     with open('data/bounds.pkl', 'rb') as f:
         dict_bounds = pickle.load(f)
 
-    with open('data/processed.pkl', 'rb') as f:
+    with open('data/selected_stats.pkl', 'rb') as f:
         data_dict = pickle.load(f)
 
     selected_areas = [
@@ -309,96 +311,178 @@ if __name__ == "__main__":
         'DHMVIIDTMRAS1m_k29', 'DHMVIIDTMRAS1m_k30', 'DHMVIIDTMRAS1m_k31',
     ]
 
+    # lists = [
+    #     (51.1602592163895, 3.66903576754469),
+    #     (51.16856439782281, 3.684281592218353),
+    #     (51.15341085178167, 3.691627218668676),
+    #     (51.1210006201385, 3.67762170323251),
+    # ]
+    # tile = find_tile_for_location(dict_bounds, lists[0][::-1])
+    # dtm, transform = load_and_crop_dtm(
+    #     dict_bounds, lists
+    # )
+    # dtm = scipy.ndimage.median_filter(dtm, size=5)
+    # for gps in lists:
+    #     p = gps_to_pixel(transform, *gps)
+    #     print(dtm[p])
+    # exit()
+
+    # list_points = {}
+    # for station_key in data_dict.keys():
+    #     tile = find_tile_for_location(dict_bounds, station_key[::-1])
+        
+    #     if tile not in list_points:
+    #         list_points[tile] = [station_key]
+    #     else:
+    #         list_points[tile].append(station_key)
+    #     for nb in data_dict[station_key]['neighbor'].keys():
+    #         tile = find_tile_for_location(dict_bounds, nb[::-1])
+    #         if tile not in list_points:
+    #             list_points[tile] = [nb]
+    #         else:
+    #             list_points[tile].append(nb)
+
+    # for tile in list_points.keys():
+    #     print(np.median(data_dict[list_points[tile][0]]['values']))
+    #     print(data_dict[list_points[tile][0]]['elevation'])
+        
+    #     dtm, transform = load_and_crop_dtm(
+    #         dict_bounds, list_points[tile]
+    #     )
+    #     # dtm = scipy.ndimage.median_filter(dtm, size=5)
+    #     for gps in list_points[tile]:
+    #         p = gps_to_pixel(transform, *gps)
+    #         print(gps, p, dtm.shape)
+    #         print(dtm[p])
+    #         exit()
+    #     exit()
+    # exit()
+
     loading_dict = {}
     for station_key in data_dict.keys():
         station_data = data_dict[station_key]
-        for ref_location in station_data['graph'].keys():
-            if 'nodes' not in station_data['graph'][ref_location].keys():
-                continue
-            nodes = station_data['graph'][ref_location]['nodes']
-            if nodes is None:
-                continue
-    
-            nodes = [station_key, *nodes, ref_location]
+        for ref_location in station_data['neighbor'].keys():
+            if ref_location not in station_data['graph'] or 'nodes' not in station_data['graph'][ref_location].keys():
+                nodes = [station_key, ref_location]
+            else:
+                nodes = station_data['graph'][ref_location]['nodes']
+                if nodes is None:
+                    continue
+
+                nodes = [station_key, *nodes, ref_location]
+            
             tiles = []
             for n in nodes: 
                 tile = find_tile_for_location(dict_bounds, n[::-1])
                 if tile not in tiles:
                     tiles.append(tile)
-            
+                
             flag = True
             for tile in tiles:
                 if tile not in selected_areas:
                     flag = False
 
-            if len(tiles) < 3 and flag:
+            if len(tiles) < 2 and flag:
                 tiles.sort()
                 tiles = tuple(tiles)
                 if tiles not in loading_dict.keys():
                     loading_dict[tiles] = []
+                # if os.path.exists(f'data/tmp/stats-{station_key}-{ref_location}.pkl'):
+                #     continue
                 loading_dict[tiles].append((station_key, ref_location, nodes))
 
-    with open('data/loading.pkl', 'wb') as f:
-        pickle.dump(loading_dict, f)
-
+    # with open('data/loading.pkl', 'wb') as f:
+    #     pickle.dump(loading_dict, f)
     # === Select nodes ===
     for kdict in loading_dict.keys():
         dtm, transform = None, None
         for pair in loading_dict[kdict]:
-            station_key, ref_location, nodes = pair
             print('xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')
             print(station_key)
             print('xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')
+            station_key, ref_location, nodes = pair
 
             station_data = data_dict[station_key]
             graph_nodes = station_data['sim_graph']['nodes']
 
-            if 'nodes' in list(station_data['graph'][ref_location].keys()):
+            path_flag = True
+            if ref_location in station_data['graph'].keys() and 'nodes' in list(station_data['graph'][ref_location].keys()):
                 nodes = station_data['graph'][ref_location]['nodes']
+
+                if nodes is None:
+                    nodes = [station_key, ref_location]
+                    path_flag = False
+                else:
+                    d1 = np.sum(abs(np.array(nodes[0]) - np.array(station_key)))
+                    d2 = np.sum(abs(np.array(nodes[0]) - np.array(ref_location)))
+                    if d1 < d2:
+                        nodes = [station_key, *nodes, ref_location]
+                    else:
+                        nodes = [ref_location, *nodes, station_key]
             else:
-                continue
-
-            if nodes is None:
-                continue
-
+                nodes = [station_key, ref_location]
+                path_flag = False
+            
             t0 = time.time()
             if dtm is None:
                 dtm, transform = load_and_crop_dtm(
                     dict_bounds, nodes
                 )
-                t0 = time.time()
+                dtm = scipy.ndimage.median_filter(dtm, size=5)
                 slope_deg = compute_slope(dtm)
-                print('Slope: ', time.time() - t0)
 
             os.makedirs(f"vis/{station_key}", exist_ok=True)
             print(f'End loading - {time.time() - t0}')
 
             t0 = time.time()
-            # === Downsample DSM for coarse path planning ===
-            list_merge_coarse_path = compute_coarse_path_from_nodes(
-                nodes, graph_nodes, transform, dtm
-            )
-            print(f'End coarse - {time.time() - t0}')
-
-            t0 = time.time()
-            for merge_coarse_path, graph_node in list_merge_coarse_path:
-                if os.path.exists(f'data/tmp/stats-{station_key}-{graph_node}.pkl'):
-                    continue
-                
-                slope, elevation, nb_results = refine_and_analyze_path(
-                    dtm, nodes, merge_coarse_path, slope_deg
+            if path_flag:
+                # === Downsample DSM for coarse path planning ===
+                list_merge_coarse_path = compute_coarse_path_from_nodes(
+                    nodes, graph_nodes, transform, dtm
                 )
 
-                data_dict[station_key]['slope'] = slope
-                data_dict[station_key]['elevation'] = elevation
+                for merge_coarse_path, graph_node in list_merge_coarse_path:
+                    # if os.path.exists(f'data/tmp/stats-{station_key}-{graph_node}.pkl'):
+                    #     continue
+                    
+                    src_loc, key_loc, nb_results = refine_and_analyze_path(
+                        dtm, nodes, merge_coarse_path, slope_deg
+                    )
 
-                nb_results['displacement'] = np.array(graph_node) - np.array(station_key) 
-                nb_results['key_slope'] = slope
-                nb_results['key_elevation'] = elevation
-                with open(f'data/tmp/stats-{station_key}-{graph_node}.pkl', 'wb') as f:
-                    pickle.dump(nb_results, f)
-            
-            print(f'End analysis - {time.time() - t0}')
+                    # data_dict[station_key]['slope'] = slope
+                    # data_dict[station_key]['elevation'] = elevation
+                    nb_results['displacement'] = np.array(graph_node) - np.array(station_key)
+                    nb_results['key_slope'] = slope_deg[key_loc[0], key_loc[1]]
+                    nb_results['key_elevation'] = dtm[key_loc[0], key_loc[1]]
+                    nb_results['src_slope'] = slope_deg[src_loc[0], src_loc[1]]
+                    nb_results['src_elevation'] = dtm[src_loc[0], src_loc[1]]
+                    with open(f'data/tmp/stats-{station_key}-{graph_node}.pkl', 'wb') as f:
+                        pickle.dump(nb_results, f)
+                    del nb_results
+            print(f'End saving - {time.time() - t0}')
+            # else:
+            #     nb_results = {
+            #         'slope_mean': -1,
+            #         'slope_std': -1,
+            #         'slope_min': -1,
+            #         'slope_max': -1,
+            #         'slope_median': -1,
+            #     }
+            #     nb_results['elevation'] = [-1, -1, -1, -1, -1, -1]
+            #     nb_results['distance'] = -1
+            #     nb_results['delta_elevation'] = dtm[
+            #         ref_location[0], ref_location[1]] - dtm[
+            #             station_key[0], station_key[1]]
+            #     nb_results['slope'] = slope_deg[ref_location[0], ref_location[1]]
 
-    with open(f'data/processed_stats.pkl', 'wb') as f:
-        pickle.dump(data_dict, f)
+            #     nb_results['key_slope'] = slope_deg[station_key[0], station_key[1]]
+            #     nb_results['key_elevation'] = dtm[station_key[0], station_key[1]]
+            #     nb_results['displacement'] = np.array(ref_location) - np.array(station_key)
+
+            #     with open(f'data/tmp/stats-{station_key}-{ref_location}.pkl', 'wb') as f:
+            #         pickle.dump(nb_results, f)
+        del dtm
+        gc.collect()
+
+    # with open(f'data/selected_stats.pkl', 'wb') as f:
+    #     pickle.dump(data_dict, f)

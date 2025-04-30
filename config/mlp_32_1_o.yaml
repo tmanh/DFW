@@ -4,7 +4,7 @@ model:
     in_dim: 18
     n_layers: 1
     n_dim: 32
-    fmts: 'wo'
+    fmts: 'o'
 
 dataset:
   inputs: 'update'

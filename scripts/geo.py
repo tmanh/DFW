@@ -4,14 +4,12 @@ import networkx as nx
 import geopandas as gpd
 import numpy as np
 
-from shapely.geometry import LineString, Point, MultiPoint, Polygon
+from shapely.geometry import Point, MultiPoint
 from shapely.ops import split
 from geopy.distance import geodesic
 from shapely.strtree import STRtree  # Faster spatial index for points
 
-import matplotlib.pyplot as plt
 from scipy import spatial
-import time
 
 
 def check_connection_and_distance(G, node1, node2):
@@ -260,13 +258,13 @@ def create_simplified_graphs(data):
 def main():
     waterways, DiG, node_ids, tree, UndiG, node2_ids, tree2 = create_waterway_graph()
 
-    with open('data/processed.pkl', 'rb') as f:
+    with open('data/selected_stats.pkl', 'rb') as f:
         data = pickle.load(f)
 
     with open('data/neighbor.pkl', 'rb') as f:
         neighbors = pickle.load(f)
 
-    if 'graph' not in data[list(data.keys())[0]].keys():
+    if True: #'graph' not in data[list(data.keys())[0]].keys():
         for k in data.keys():
             print(f'<>----{k}----<>')
             qry2_node, _, _ = find_nearest_edge(tree2, node2_ids, k, UndiG)
@@ -302,7 +300,7 @@ def main():
                     data[k]['graph'][nb]['edges'] = None
                     data[k]['graph'][nb]['nodes'] = None
 
-        with open(f'data/processed.pkl', 'wb') as f:
+        with open(f'data/selected_stats.pkl', 'wb') as f:
             pickle.dump(data, f)
 
     # dict_keys(
@@ -320,90 +318,10 @@ def main():
         for edge in graph['edges']:
             print("  ", edge)
         print()
-        # visualize_graph_opencv(graph)
 
-    with open('data/processed.pkl', 'wb') as f:
+    with open('data/selected_stats.pkl', 'wb') as f:
         pickle.dump(data, f)
     exit()
-    
-    # for k in data.keys():
-    #     del data[k]['rainfall']
-
-    #     data[k]['mean_w'] = {}
-    #     data[k]['max_zw'] = {}
-    #     data[k]['std_w'] = {}
-
-    #     for nb in data[k]['neighbor']:
-    #         if nb in data[k]['neighbor_path'] and 'area' in data[k]['neighbor_path'][nb]:
-    #             areas = data[k]['neighbor_path'][nb]['area']
-    #             distances = [
-    #                 abs(e[0][1] - e[1][1]) + abs(e[0][0] - e[1][0]) for e in data[k]['neighbor_path'][nb]['edges']
-    #             ]
-
-    #             avg_widths = np.array([a / (d * 1000 * 1000) for a, d in zip(areas, distances)])
-                
-    #             if len(areas) > 0:
-    #                 mean_w = np.mean(avg_widths)
-    #                 std_w = np.std(avg_widths)
-
-    #                 if std_w == 0:
-    #                     max_zw = 0
-    #                 else:
-    #                     max_zw = ((avg_widths - mean_w) / std_w).max()
-    #             else:
-    #                 mean_w = -1
-    #                 std_w = -1
-    #                 max_zw = -1
-    #         else:
-    #             mean_w = -1
-    #             std_w = -1
-    #             max_zw = -1
-
-    #         data[k]['mean_w'][nb] = mean_w
-    #         data[k]['max_zw'][nb] = max_zw
-    #         data[k]['std_w'][nb] = std_w
-    
-    # with open('all_data_new_median3.pkl', 'wb') as f:
-    #     pickle.dump(data, f)
-    # exit()
-
-    # list_p = [((4.2270005, 50.9436381), (4.2270833, 50.9436798)), ((4.2269236, 50.9435815), (4.2270005, 50.9436381)), ((4.2268816, 50.9435505), (4.2269236, 50.9435815)), ((4.2267746, 50.9434946), (4.2268816, 50.9435505)), ((4.2266833, 50.9434312), (4.2267746, 50.9434946)), ((4.2265782, 50.9433274), (4.2266833, 50.9434312)), ((4.2265249, 50.9432497), (4.2265782, 50.9433274))]
-    # p1 = (3.8715394, 50.8040931)
-    # p2 = (3.8718304, 50.8042185)
-    # print(f"Load Data Time: {time.time() - start}")
-
-    # for pp in list_p:
-    #     p1, p2 = pp[0], pp[1]
-    #     start = time.time()
-    #     area = find_area_path(p1, p2, water)
-    #     end = time.time()
-    #     print(f"({(p1[1], p1[0])}, {(p2[1], p2[0])}) - Time: {end - start} - Total water surface area: {area:.2f} square meters")
-    # exit()
-
-    # for k in data.keys():
-    #     average = np.median(data[k]['series'])
-    #     data[k]['avg'] = average
-
-    # with open('all_data_new_median2.pkl', 'wb') as f:
-    #     pickle.dump(data, f)
-
-    # for k in data.keys():
-    #     average = np.median(data[k]['series'])
-    #     x = [v - average for v in data[k]['series']]
-    #     y = data[k]['time']
-
-    #     threshold = np.percentile(x, 75)
-
-    #     filtered_pairs = [(v, t) for v, t in zip(x, y) if v >= threshold]
-    #     data[k]['top_25_series'], data[k]['top_25_time'] = zip(*filtered_pairs) if filtered_pairs else ([], [])
-    # with open('all_data_new_median2.pkl', 'wb') as f:
-    #     pickle.dump(data, f)
-    # exit()
-
-    
-
-    with open('all_data_new_median3.pkl', 'wb') as f:
-        pickle.dump(data, f)
 
 
 def create_waterway_graph():
