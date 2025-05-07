@@ -11,7 +11,7 @@ class InverseDistance(nn.Module):
         super().__init__()
 
     def forward(self, xs, x, valid, inputs, train, stage):
-        weights = (1 / xs[:, :, 0:1]) * valid
+        weights = (1 / (torch.abs(xs[:, :, 1:2]) + torch.abs(xs[:, :, 2:3]))) * valid
         alpha = weights / (torch.sum(weights, dim=1, keepdim=True) + 1e-8)
         return torch.sum(x * alpha, dim=1, keepdim=True)
 

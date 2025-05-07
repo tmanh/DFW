@@ -81,5 +81,4 @@ class GATWithEdgeAttr(torch.nn.Module):
             mask = torch.sigmoid(self.fuse_mlp(new_nodes).view(N, -1))
             
             nodes = (1 - mask) * nodes + not_valid_mask * mask * new_nodes_values[:, :new_nodes_values.shape[-1]//2]
-
         return nodes[0].unsqueeze(0).squeeze(-1)

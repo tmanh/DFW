@@ -16,7 +16,7 @@ from common.graph import *
 from common.vis import *
 
 
-def compute_waterway_elevation_statistics(cropped_dsm, waterway_mask):
+def compute_waterway_elevation_statistics(cropped_dsm, centerline_coords):
     """
     Compute elevation statistics for the waterway portion of a cropped DSM.
     
@@ -34,13 +34,18 @@ def compute_waterway_elevation_statistics(cropped_dsm, waterway_mask):
     over only the waterway pixels.
     
     :param cropped_dsm: 2D numpy array of elevation values.
-    :param waterway_mask: Boolean 2D array (same shape as cropped_dsm) indicating the waterway.
+    :param centerline_coords: centerline_coords
     :return: Tuple (avg_elevation, std_elevation, max_z, mean_z, min_z, std_z)
     """
     # Select only the waterway elevations.
-    waterway_elevations = cropped_dsm[waterway_mask]
-    
-    if waterway_elevations.size == 0:
+    waterway_elevations = []
+    h, w = dtm.shape
+    for row, col in centerline_coords:
+        ri, ci = int(round(row)), int(round(col))
+        if 0 <= ri < h and 0 <= ci < w:
+            waterway_elevations.append(cropped_dsm[ri, ci])
+
+    if len(waterway_elevations) == 0:
         # If there are no waterway pixels, return zeros.
         return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     
@@ -186,7 +191,7 @@ def load_and_crop_dtm(dict_bounds, nodes, dsm_root='data/dtm'):
 
 
 def compute_coarse_path_from_nodes(
-    nodes, graph_nodes, transform, coarse_dtm
+    nodes, graph_nodes, transform
 ):
     """
     Computes a merged coarse path from a sequence of GPS nodes using Dijkstra on a downsampled DSM.
@@ -194,7 +199,6 @@ def compute_coarse_path_from_nodes(
     Args:
         nodes (list of tuples): List of (lat, lon) GPS coordinates.
         transform (Affine): Affine transform of the DSM.
-        coarse_dtm (np.ndarray): Downsampled DSM.
 
     Returns:
         list: Merged list of coarse path points (pixel coordinates).
@@ -214,7 +218,7 @@ def compute_coarse_path_from_nodes(
             continue
 
         # Compute path for this segment
-        path = find_line_path(coarse_dtm, coarse1, coarse2)
+        path = find_line_path(coarse1, coarse2)
 
         merge_coarse_path.append(path)
         if nodes[i + 1] in graph_nodes:
@@ -243,15 +247,11 @@ def refine_and_analyze_path(cropped_dtm, nodes, coarse_path, slope_deg):
     # === Expand waterway ===
     distance = total_distance(nodes)
 
-    skeleton = np.zeros(cropped_dtm.shape, dtype=bool)
-    flattened = np.array(flattened)  # shape = (N, 2)
-    xs, ys = flattened[:, 0], flattened[:, 1]
-    skeleton[xs, ys] = True
-
     slope_stats = slope_statistics_along_centerline(slope_deg, flattened)
     
     results = {}
-    stats = compute_waterway_elevation_statistics(cropped_dtm, skeleton)
+    stats = compute_waterway_elevation_statistics(cropped_dtm, flattened)
+
     results['elevation'] = stats
     results['distance'] = distance
     results['delta_elevation'] = cropped_dtm[
@@ -366,10 +366,10 @@ if __name__ == "__main__":
                 nodes = [station_key, ref_location]
             else:
                 nodes = station_data['graph'][ref_location]['nodes']
-                if nodes is None:
-                    continue
-
-                nodes = [station_key, *nodes, ref_location]
+                if nodes is not None:
+                    nodes = [station_key, *nodes, ref_location]
+                else:
+                    nodes = [station_key, ref_location]
             
             tiles = []
             for n in nodes: 
@@ -387,15 +387,52 @@ if __name__ == "__main__":
                 tiles = tuple(tiles)
                 if tiles not in loading_dict.keys():
                     loading_dict[tiles] = []
-                # if os.path.exists(f'data/tmp/stats-{station_key}-{ref_location}.pkl'):
-                #     continue
+                if os.path.exists(f'data/tmp/stats-{station_key}-{ref_location}.pkl'):
+                    continue
                 loading_dict[tiles].append((station_key, ref_location, nodes))
+
+    for kdict in loading_dict.keys():
+        all_nodes = []
+        for pair in loading_dict[kdict]:
+            station_key, ref_location, nodes = pair
+            all_nodes.extend(nodes)
+
+        dtm, transform = load_and_crop_dtm(
+            dict_bounds, nodes
+        )
+
+        for pair in loading_dict[kdict]:
+            station_key, ref_location, nodes = pair
+
+            # Convert to full-res pixel positions
+            key_pos = gps_to_pixel(transform, *station_key)
+            ref_pos = gps_to_pixel(transform, *ref_location)
+
+            data_dict[station_key]['elevation'] = dtm[key_pos[0], key_pos[1]]
+            if ref_location in data_dict:
+                data_dict[ref_location]['elevation'] = dtm[ref_pos[0], ref_pos[1]]
+
+    with open('data/selected_stats.pkl', 'wb') as f:
+        pickle.dump(data_dict, f)
+    exit()
 
     # with open('data/loading.pkl', 'wb') as f:
     #     pickle.dump(loading_dict, f)
     # === Select nodes ===
     for kdict in loading_dict.keys():
-        dtm, transform = None, None
+        t0 = time.time()
+        all_nodes = []
+        for pair in loading_dict[kdict]:
+            station_key, ref_location, nodes = pair
+            all_nodes.extend(nodes)
+
+        dtm, transform = load_and_crop_dtm(
+            dict_bounds, nodes
+        )
+        dtm = scipy.ndimage.median_filter(dtm, size=5)
+        slope_deg = compute_slope(dtm)
+        print(f'End loading - {time.time() - t0}')
+
         for pair in loading_dict[kdict]:
             print('xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')
             print(station_key)
@@ -413,45 +450,29 @@ if __name__ == "__main__":
                     nodes = [station_key, ref_location]
                     path_flag = False
                 else:
-                    d1 = np.sum(abs(np.array(nodes[0]) - np.array(station_key)))
-                    d2 = np.sum(abs(np.array(nodes[0]) - np.array(ref_location)))
-                    if d1 < d2:
-                        nodes = [station_key, *nodes, ref_location]
-                    else:
-                        nodes = [ref_location, *nodes, station_key]
+                    nodes = [station_key, *nodes, ref_location]
             else:
                 nodes = [station_key, ref_location]
                 path_flag = False
-            
-            t0 = time.time()
-            if dtm is None:
-                dtm, transform = load_and_crop_dtm(
-                    dict_bounds, nodes
-                )
-                dtm = scipy.ndimage.median_filter(dtm, size=5)
-                slope_deg = compute_slope(dtm)
-
-            os.makedirs(f"vis/{station_key}", exist_ok=True)
-            print(f'End loading - {time.time() - t0}')
 
             t0 = time.time()
             if path_flag:
                 # === Downsample DSM for coarse path planning ===
                 list_merge_coarse_path = compute_coarse_path_from_nodes(
-                    nodes, graph_nodes, transform, dtm
+                    nodes, graph_nodes, transform
                 )
 
                 for merge_coarse_path, graph_node in list_merge_coarse_path:
-                    # if os.path.exists(f'data/tmp/stats-{station_key}-{graph_node}.pkl'):
-                    #     continue
+                    if os.path.exists(f'data/tmp/stats-{station_key}-{graph_node}.pkl'):
+                        continue
                     
                     src_loc, key_loc, nb_results = refine_and_analyze_path(
                         dtm, nodes, merge_coarse_path, slope_deg
                     )
 
-                    # data_dict[station_key]['slope'] = slope
-                    # data_dict[station_key]['elevation'] = elevation
                     nb_results['displacement'] = np.array(graph_node) - np.array(station_key)
+                    key_loc = gps_to_pixel(transform, *station_key)
+                    src_loc = gps_to_pixel(transform, *graph_node)
                     nb_results['key_slope'] = slope_deg[key_loc[0], key_loc[1]]
                     nb_results['key_elevation'] = dtm[key_loc[0], key_loc[1]]
                     nb_results['src_slope'] = slope_deg[src_loc[0], src_loc[1]]
@@ -460,28 +481,8 @@ if __name__ == "__main__":
                         pickle.dump(nb_results, f)
                     del nb_results
             print(f'End saving - {time.time() - t0}')
-            # else:
-            #     nb_results = {
-            #         'slope_mean': -1,
-            #         'slope_std': -1,
-            #         'slope_min': -1,
-            #         'slope_max': -1,
-            #         'slope_median': -1,
-            #     }
-            #     nb_results['elevation'] = [-1, -1, -1, -1, -1, -1]
-            #     nb_results['distance'] = -1
-            #     nb_results['delta_elevation'] = dtm[
-            #         ref_location[0], ref_location[1]] - dtm[
-            #             station_key[0], station_key[1]]
-            #     nb_results['slope'] = slope_deg[ref_location[0], ref_location[1]]
-
-            #     nb_results['key_slope'] = slope_deg[station_key[0], station_key[1]]
-            #     nb_results['key_elevation'] = dtm[station_key[0], station_key[1]]
-            #     nb_results['displacement'] = np.array(ref_location) - np.array(station_key)
-
-            #     with open(f'data/tmp/stats-{station_key}-{ref_location}.pkl', 'wb') as f:
-            #         pickle.dump(nb_results, f)
         del dtm
+        del transform
         gc.collect()
 
     # with open(f'data/selected_stats.pkl', 'wb') as f:

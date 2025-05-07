@@ -13,7 +13,7 @@ from geopy.distance import geodesic
 from datetime import datetime, timedelta
 from dateutil import parser
 from torch.utils.data import Dataset
-from scipy.signal import find_peaks
+from scipy.signal import medfilt
 
 from torch_geometric.data import Data
 
@@ -137,7 +137,7 @@ class WaterDataset(Dataset):
         self.length = length
         self.n_neighbors = n_neighbors
 
-        with open(path, 'rb') as f:
+        with open('data/selected_stats.pkl', 'rb') as f:
             data = pickle.load(f)
 
         with open('data/loading.pkl', 'rb') as f:
@@ -150,14 +150,16 @@ class WaterDataset(Dataset):
         ]
 
         self.invalid_list = [
-            (51.1756499380089, 3.2096433241855),
+            # test
+            (50.812199, 3.61216),
+            (50.89711467, 3.601662218),
             (51.226010931417, 4.4488923983755),
-            (50.86571265, 3.993580156),
-            (50.86819925, 4.012681623),
-            (50.86176331477927, 3.765947100079222),
-            (50.88070814784588, 4.153957051838565),
-            (51.2547794090726, 4.19909406808755),
-            (50.87907571883665, 3.742391593839773),
+            (50.8260145913424, 3.61160845853722),
+            (51.019212, 3.703334),
+            (51.020861, 3.697731),
+            (51.003619, 3.747527),
+            (51.035775, 3.668258),
+            (51.006583, 3.652972),
         ]
 
         self.stations_in_selected_areas = []
@@ -171,15 +173,27 @@ class WaterDataset(Dataset):
                     [kk[0] for kk in self.loading[a]]
                 )
 
+        # if not os.path.exists('data/selected_stats.pkl'): # True:#
+        #     new_data = {}
+        #     for k in data.keys():
+        #         if k in self.stations_in_selected_areas and k not in self.invalid_list:
+        #             new_data[k] = data[k]
+
+        #     with open('data/selected_stats.pkl', 'wb') as f:
+        #         pickle.dump(new_data, f)
+
+        #     exit()
+        
         self.using_keys = []
         self.data = {}
         for k in data.keys():
             if k in selected_stations and k in self.stations_in_selected_areas and k not in self.invalid_list:
                 new_nb = {
-                    nb_: data[k]['neighbor'][nb_] for nb_ in data[k]['neighbor'] if nb_ in selected_stations and nb_ in data.keys() and len(data[nb_]['values']) > self.length and (os.path.exists(f'data/tmp/stats-{k}-{nb_}.pkl') or os.path.exists(f'data/tmp/stats-{nb_}-{k}.pkl')) and abs(np.nanmedian(data[nb_]['values']) - np.nanmedian(data[k]['values'])) < 4.0 and len(data[nb_]['values']) / len(data[k]['values']) > 0.5
+                    nb_: data[k]['neighbor'][nb_] for nb_ in data[k]['neighbor'] if nb_ in selected_stations and nb_ in data.keys() and len(data[nb_]['values']) > self.length and len(data[k]['values']) > self.length and len(data[nb_]['values']) / len(data[k]['values']) > 0.5
                 }
 
                 data[k]['neighbor'] = new_nb
+
                 self.data[k] = data[k]
                 
                 if len(list(new_nb.keys())) > 0:
@@ -201,18 +215,12 @@ class WaterDataset(Dataset):
                 pickle.dump(self.data, f) 
         else:
             with open(f'data/{stage}.pkl', 'rb') as f:
-                self.data = pickle.load(f) 
+                self.data = pickle.load(f)
+            print(f'Final {stage} length: ', len(list(self.data.keys())))
 
-        if not os.path.exists('data/selected_stats.pkl'): # True:#
-            new_data = {}
-            for k in self.data.keys():
-                if k in self.stations_in_selected_areas and k not in self.invalid_list:
-                    new_data[k] = self.data[k]
-
-            with open('data/selected_stats.pkl', 'wb') as f:
-                pickle.dump(new_data, f)
-
-            exit()
+        # with open('data/selected_stats.pkl', 'wb') as f:
+        #     pickle.dump(self.data, f)
+        # exit()
 
     def __len__(self):
         return len(self.using_keys) if not self.train else len(self.using_keys) * 10
@@ -254,6 +262,8 @@ class WaterDataset(Dataset):
         while keep_running:
             nb, loc_time, loc_vals = self.get_time_values_from_loc(loc_key)
 
+            loc_vals = medfilt(loc_vals, kernel_size=5)  # try 3, 5, or 7
+            print(loc_key)
             x = []
             xs = []
             es = []
@@ -264,11 +274,11 @@ class WaterDataset(Dataset):
 
             for i in range(len(nb)):
                 _nb = nb[i]
-                
+
                 time_to_idx_nb = {t: idx for idx, t in enumerate(self.data[_nb]['time'])}
                 idx_matches = [time_to_idx_nb.get(t, -1) for t in loc_time]
                 nb_values = [self.original_data[_nb]['values'][idx] if idx != -1 else -1 for idx in idx_matches]
-                
+    
                 if np.mean(nb_values) < 0:
                     continue
 
@@ -283,11 +293,28 @@ class WaterDataset(Dataset):
                         _xs, e, _, _ = self.get_neighbor_input(stats)
                         direction = 1
                 else:
-                    print('file')
-                    continue
+                    displacement = np.array(_nb) - np.array(loc_key)
+                    if 'elevation' not in self.data[_nb].keys():
+                        print(_nb)
+                        continue
+                    if 'elevation' not in self.data[loc_key].keys():
+                        print(loc_key)
+                        continue
+                    
+                    delta_elevation = self.data[_nb]['elevation'] - self.data[loc_key]['elevation']
+                    _xs = [
+                        # distance features
+                        -1, displacement[0], displacement[1],
+                        # elevation features
+                        -1, -1, -1, -1, -1, -1, delta_elevation,
+                        # slope features
+                        -1, -1,
+                        -1, -1, -1, -1, -1
+                    ]
 
+                print(_nb, _xs[0])
                 if 'median' not in self.data[_nb].keys():
-                    self.data[_nb]['median'] = np.nanmedian(self.data[_nb]['values'])
+                    self.data[_nb]['median'] = np.median(self.data[_nb]['values'])
                     if math.isnan(self.data[_nb]['median']):
                         print('nan')
                         continue
@@ -297,7 +324,7 @@ class WaterDataset(Dataset):
                 x.append(nb_values)
 
             if 'median' not in self.data[loc_key].keys():
-                self.data[loc_key]['median'] = np.nanmedian(self.data[loc_key]['values'])
+                self.data[loc_key]['median'] = np.median(self.data[loc_key]['values'])
             loc_vals = loc_vals - self.data[loc_key]['median']
 
             if len(x) <= 0:
@@ -315,7 +342,6 @@ class WaterDataset(Dataset):
         valid = (x > 0).float()
         x = x - es
         y = torch.tensor(loc_vals).float()
-
         return x, xs, y, es, valid
 
     def get_time_values_from_loc(self, loc_key):
@@ -335,7 +361,7 @@ class WaterDataset(Dataset):
         low_idx = np.where(self.data[loc_key]['time'] == min_t)
         high_idx = np.where(self.data[loc_key]['time'] == max_t)
 
-        if len(low_idx[0]) > 0:
+        if len(low_idx[0]) > 0 and len(high_idx[0]) > 0:
             low_idx = low_idx[0][0]
             high_idx = high_idx[0][0]
         else:
@@ -370,20 +396,19 @@ class GWaterDataset(WaterDataset):
         keep_running = True
         while keep_running:
             nb, loc_time, loc_vals = self.get_time_values_from_loc(loc_key)
+
             updated = False
 
             if nb is None:
                 print(loc_key)
                 continue
 
-            loc_vals = np.array(loc_vals, dtype=np.float32)  # Ensure NumPy array
-
-            if self.train and 'median' in self.data[loc_key].keys() and np.mean(loc_vals) - self.data[loc_key]['median'] < 0.3:
-                continue
-
+            loc_vals = medfilt(loc_vals, kernel_size=5)  # try 3, 5, or 7
+            
             ndict = {loc_key: {'idx': 0, 'f': np.zeros_like(loc_vals).tolist()}}
             edict = {}
 
+            es = []
             src_values = []
             good_nb = []
             valid = [np.zeros_like(loc_vals, dtype=np.int32).tolist()]
@@ -391,7 +416,8 @@ class GWaterDataset(WaterDataset):
             for _nb in nb:
                 time_to_idx_nb = {t: idx for idx, t in enumerate(self.data[_nb]['time'])}
                 idx_matches = [time_to_idx_nb.get(t, -1) for t in loc_time]
-                nb_values = [self.data[_nb]['values'][idx] if idx != -1 else -1 for idx in idx_matches]
+                nb_values = [self.original_data[_nb]['values'][idx] if idx != -1 else -1 for idx in idx_matches]
+
                 nb_values = np.array(nb_values, dtype=np.float32)
 
                 if np.mean(nb_values) < 0:
@@ -402,15 +428,32 @@ class GWaterDataset(WaterDataset):
                 if os.path.exists(f'data/tmp/stats-{loc_key}-{_nb}.pkl'):
                     with open(f'data/tmp/stats-{loc_key}-{_nb}.pkl', 'rb') as f:
                         stats = pickle.load(f)
-                        _xs, e, se, ke = self.get_neighbor_input(stats)
+                        _xs, _, _, _ = self.get_neighbor_input(stats)
                         direction = -1
                 elif os.path.exists(f'data/tmp/stats-{_nb}-{loc_key}.pkl'):
                     with open(f'data/tmp/stats-{_nb}-{loc_key}.pkl', 'rb') as f:
                         stats = pickle.load(f)
-                        _xs, e, se, ke = self.get_neighbor_input(stats)
+                        _xs, _, _, _ = self.get_neighbor_input(stats)
                         direction = 1
                 else:
-                    continue
+                    displacement = np.array(_nb) - np.array(loc_key)
+                    if 'elevation' not in self.data[_nb].keys():
+                        print(_nb)
+                        continue
+                    if 'elevation' not in self.data[loc_key].keys():
+                        print(loc_key)
+                        continue
+                    delta_elevation = self.data[_nb]['elevation'] - self.data[loc_key]['elevation']
+                    _xs = [
+                        # distance features
+                        -1, displacement[0], displacement[1],
+                        # elevation features
+                        -1, -1, -1, -1, -1, -1, delta_elevation,
+                        # slope features
+                        -1, -1,
+                        -1, -1, -1, -1, -1
+                    ]
+                    direction = 0
 
                 # Median handling
                 if 'median' not in self.data[_nb]:
@@ -418,6 +461,9 @@ class GWaterDataset(WaterDataset):
 
                 valid.append((nb_values > 0).astype(np.int32).tolist())
 
+                src_values.append(nb_values.tolist())
+
+                es.append(self.data[_nb]['median'])
                 nb_values -= self.data[_nb]['median']
 
                 if not updated:
@@ -429,7 +475,6 @@ class GWaterDataset(WaterDataset):
                 ndict = self.update_node_dict(ndict, _nb, nb_values.tolist())
                 edict[(_nb, loc_key)] = [*_xs, direction]
                 good_nb.append(_nb)
-                src_values.append(nb_values.tolist())
 
             if len(good_nb) <= 0:
                 print('======>', loc_key)
@@ -451,7 +496,7 @@ class GWaterDataset(WaterDataset):
                         found = True
                         with open(path, 'rb') as f:
                             stats = pickle.load(f)
-                            _xs, e, ke, se = self.get_neighbor_input(stats)
+                            _xs, _, _, _ = self.get_neighbor_input(stats)
                         
                         if (edge[1], edge[0]) not in edict.keys():
                             edict[(edge[0], edge[1])] = [*_xs, edge[-1]]
@@ -502,79 +547,12 @@ class GWaterDataset(WaterDataset):
         # Create PyTorch Geometric Data object
         graph_data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
         valid = torch.tensor(valid)
-        return torch.tensor(loc_vals), torch.tensor(src_values), valid, graph_data
+
+        es = np.array(es)
+        es = torch.tensor(es).float().unsqueeze(-1)
+        return torch.tensor(loc_vals), torch.tensor(src_values) - es, valid, graph_data
 
     def update_node_dict(self, ndict, _nb, nb_values):
         if _nb not in ndict.keys():
             ndict[_nb] = {'idx': len(ndict.keys()), 'f': nb_values}
         return ndict
-    
-
-
-def visualize_edge_index(edge_index, directed=True, title="Graph Visualization"):
-    """
-    Visualize a graph from a PyTorch-style edge_index tensor using matplotlib and networkx.
-
-    Parameters:
-        edge_index (torch.Tensor): Tensor of shape [2, num_edges] representing edges.
-        directed (bool): Whether to treat the graph as directed.
-        title (str): Title for the plot.
-    """
-    assert edge_index.shape[0] == 2, "edge_index must be of shape [2, num_edges]"
-    
-    # Choose graph type
-    G = nx.DiGraph() if directed else nx.Graph()
-
-    # Convert tensor to list of edge tuples
-    edges = list(zip(edge_index[0].tolist(), edge_index[1].tolist()))
-    G.add_edges_from(edges)
-
-    # Layout and drawing
-    plt.figure(figsize=(6, 4))
-    pos = nx.spring_layout(G, seed=42)
-    nx.draw(
-        G, pos,
-        with_labels=True,
-        node_color='lightcoral',
-        edge_color='gray',
-        node_size=1000,
-        font_size=14,
-        arrows=directed
-    )
-    plt.title(title)
-    plt.show()
-
-
-def plot_time_series_comparison(data, _nb, loc_key, idx=0, output_path='time_series_comparison.png'):
-    """
-    Plot and save two time series (from keys _nb and loc_key) in the data dictionary.
-    
-    Args:
-        data (dict): Dictionary with keys (_nb, loc_key), each mapping to
-                     {'time': [...], 'values': [...]}.
-        _nb (hashable): First location key.
-        loc_key (hashable): Second location key.
-        output_path (str): Where to save the plot image.
-    """
-    t1 = data[_nb]['time'][idx:]
-    v1 = data[_nb]['values'][idx:]
-    t2 = data[loc_key]['time'][idx:]
-    v2 = data[loc_key]['values'][idx:]
-
-    # Create output directory if needed
-    # os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-    # Plot
-    plt.figure(figsize=(12, 6))
-    plt.plot(t1, v1, label=f'Station {_nb}', linestyle='-', marker='o')
-    plt.plot(t2, v2, label=f'Station {loc_key}', linestyle='--', marker='x')
-    plt.xlabel('Time')
-    plt.ylabel('Value')
-    plt.title('Time Series Comparison')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(output_path)
-    plt.close()
-
-    print(f"[✓] Time series comparison saved to: {output_path}")

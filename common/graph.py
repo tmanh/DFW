@@ -64,7 +64,7 @@ def dijkstra_water_cost(dsm, start, end):
     return [(p[0], p[1]) for p in path]  # Convert back to full DSM indices
 
 
-def find_line_path(dsm, start, end):
+def find_line_path(start, end):
     """
     Generate points along the straight line between start and end.
 

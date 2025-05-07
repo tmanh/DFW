@@ -11,8 +11,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from common.utils import instantiate_from_config
-from model.attention import MLPAttention
-from model.distance import InverseDistance
 from model.mlp import *
 from sklearn.cluster import KMeans
 
@@ -21,10 +19,10 @@ from torch.utils.data import DataLoader
 
 from omegaconf import OmegaConf
 from tqdm import tqdm
+from torchmetrics.functional import pearson_corrcoef
+
 
 logging.basicConfig(filename="log-test-all.txt", level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-random.seed(42)  # Replace 42 with any integer seed you want
 
 
 def plot_graph(o, y, x):
@@ -57,7 +55,7 @@ def plot_graph(o, y, x):
     plt.close()
 
     print(f"Plot saved to {output_path}")
-    input()
+    input('Enter to continue: ')
 # contribute, method, results
 
 def get_checkpoint_name(cfg):
@@ -144,6 +142,22 @@ def neighbor_degradation_penalty_loss(o, x, y, alpha=1.0):
     return main_loss + alpha * penalty.mean()
 
 
+def pearson_corrcoef(x, y, dim=-1, eps=1e-8):
+    """
+    Compute Pearson correlation between x and y along given dimension.
+    Assumes x and y are of the same shape.
+    """
+    x_centered = x - x.mean(dim=dim, keepdim=True)
+    y_centered = y - y.mean(dim=dim, keepdim=True)
+
+    cov = (x_centered * y_centered).mean(dim=dim)
+    std_x = x_centered.std(dim=dim)
+    std_y = y_centered.std(dim=dim)
+
+    corr = cov / (std_x * std_y + eps)
+    return corr
+
+
 def neighbor_degradation_penalty_loss(o, x, y, alpha=1.0):
     """
     o: (B, N, T) - model outputs per neighbor
@@ -172,24 +186,23 @@ def neighbor_degradation_penalty_loss(o, x, y, alpha=1.0):
 
 
 def test(cfg, train=True):
-    with open('data/selected_stats.pkl', 'rb') as f:
-        data = pickle.load(f)
+    if not os.path.exists('data/split.pkl'):
+        with open('data/selected_stats.pkl', 'rb') as f:
+            data = pickle.load(f)
 
-    good_nb_extended, test_nb = split_stations_by_clusters(data)
-    # if not os.path.exists('test_nb.pkl'):
-    #     with open('test_nb.pkl', 'wb') as f:
-    #         pickle.dump(test_nb, f)
-    # else:
-    #     with open('test_nb.pkl', 'rb') as f:
-    #         test_nb = pickle.load(f)
-    print('Train length: ', len(good_nb_extended))
-    print('Test length: ', len(test_nb))
-    with open('split.pkl', 'wb') as f:
-        pickle.dump(
-            {'train': good_nb_extended, 'test': test_nb},
-            f
-        )
-    # exit()
+        good_nb_extended, test_nb = split_stations_by_clusters(data)
+        print('Train length: ', len(good_nb_extended))
+        print('Test length: ', len(test_nb))
+        with open('data/split.pkl', 'wb') as f:
+            pickle.dump(
+                {'train': good_nb_extended, 'test': test_nb},
+                f
+            )
+    else:
+        with open('data/split.pkl', 'rb') as f:
+            split = pickle.load(f)
+            good_nb_extended = split['train']
+            test_nb = split['test']
 
     # 🔹 1️⃣ Define Device (Multi-GPU)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -283,7 +296,12 @@ def test(cfg, train=True):
     )
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
     results = {
-        k:{'loss-p': 0, 'loss': 0, 'count': 0, 'name': list(test_dataset.data.keys())[k], 'range': 0} for k in range(len(list(test_dataset.data.keys())))
+        k:{
+            'corr': [],
+            'loss': [],
+            'best': [],
+            'mean': [],
+        } for k in range(len(list(test_dataset.data.keys())))
     }
 
     with torch.no_grad():
@@ -294,9 +312,6 @@ def test(cfg, train=True):
                 valid = mvalid[:, :, i*1024:(i+1)*1024].to(device)
                 xs = mxs.to(device)
                 y = my[:, i*1024:(i+1)*1024].to(device)
-
-                if torch.abs(torch.mean(y)) < 0.3:
-                    continue
 
                 o = model(xs, x, valid, inputs=cfg.dataset.inputs, train=False, stage=-1)
                 # from calflops import calculate_flops
@@ -317,17 +332,31 @@ def test(cfg, train=True):
                 # exit()
                 # o1 = idw(xs, x, inputs=cfg.dataset.inputs, train=False, stage=-1)
 
-                l1_elements = torch.abs(o - y.unsqueeze(1))
-                ploss = torch.abs(o - y.unsqueeze(1)) / (y.unsqueeze(1) + 1e-8)
-                ploss = torch.mean(ploss)
-                loss = torch.mean(l1_elements)
+                l1_elements = (o - y) ** 2
+                loss = torch.sqrt(torch.mean(l1_elements))
 
-                results[idx]['loss-p'] += ploss.item()
-                results[idx]['loss'] += loss.item()
-                results[idx]['count'] += 1 
-                # plot_graph(o, y, x)
+                corr = pearson_corrcoef(
+                    o.flatten(),
+                    y.flatten()
+                )
+                mean_corr = corr.mean()
+
+                cvalid = torch.mean(valid, dim=-1)
+                if torch.sum(cvalid > 0) == 0:
+                    continue
+
+                min_d = torch.min(torch.mean(torch.abs(y.unsqueeze(1) - x), dim=-1), dim=-1)[0]
+
+                results[idx]['corr'].append(mean_corr.item())
+                results[idx]['loss'].append(loss.item())
+                results[idx]['best'].append(torch.abs(min_d).item())
+                results[idx]['mean'].append(torch.mean(torch.abs(y)).item())
+
+                if x.shape[1] == 5:
+                    plot_graph(o, y, x)
+                
             print(f'Elapsed: {time.time() - start}')
-    
+
     rn = cfg.model['target']
     with open(f'{rn}-{cfg.model.params.fmts}-results.pkl', 'wb') as f:
         pickle.dump(results, f)

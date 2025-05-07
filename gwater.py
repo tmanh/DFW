@@ -5,7 +5,6 @@ import time
 from omegaconf import OmegaConf
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 
 import matplotlib.pyplot as plt
@@ -22,7 +21,6 @@ from tqdm import tqdm
 from model.gnn import GATWithEdgeAttr
 from model.mlp import *
 
-random.seed(42)  # Replace 42 with any integer seed you want
 logging.basicConfig(filename="log-test-all-gnn.txt", level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
@@ -155,8 +153,24 @@ def plot_graph(o, y, x):
     input()
 
 
+def pearson_corrcoef(x, y, dim=-1, eps=1e-8):
+    """
+    Compute Pearson correlation between x and y along given dimension.
+    Assumes x and y are of the same shape.
+    """
+    x_centered = x - x.mean(dim=dim, keepdim=True)
+    y_centered = y - y.mean(dim=dim, keepdim=True)
+
+    cov = (x_centered * y_centered).mean(dim=dim)
+    std_x = x_centered.std(dim=dim)
+    std_y = y_centered.std(dim=dim)
+    
+    corr = cov / (std_x * std_y + eps)
+    return corr
+
+
 def test(cfg, out, n_points, model_size, inputs, train=True, testing_train=False):
-    with open('split.pkl', 'rb') as f:
+    with open('data/split.pkl', 'rb') as f:
         split = pickle.load(f)
         good_nb_extended = split['train']
         test_nb = split['test']
@@ -228,25 +242,28 @@ def test(cfg, out, n_points, model_size, inputs, train=True, testing_train=False
         path='data/selected_stats.pkl', train=False,
         selected_stations=test_nb, input_type=cfg.dataset.inputs
     )
+
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
     results = {
-        k:{'loss-p': 0, 'loss': 0, 'count': 0, 'name': list(test_dataset.data.keys())[k], 'range': 0} for k in range(len(list(test_dataset.data.keys())))
+        k:{
+            'corr': [],
+            'loss': [],
+            'best': [],
+            'mean': [],
+        } for k in range(len(list(test_dataset.data.keys())))
     }
+
     with torch.no_grad():
         for idx, (my, mx, mvalid, graph_data) in enumerate(test_loader):
             mnodes = graph_data.x.unsqueeze(-1)
             edge_index = graph_data.edge_index.to(device)
             edge_attr = graph_data.edge_attr.to(device)
-
             start = time.time()
             for i in range(mx.shape[2] // 1024):
                 x = mx[:, :, i*1024:(i+1)*1024].to(device)
                 valid = mvalid[:, :, i*1024:(i+1)*1024].to(device)
                 y = my[:, i*1024:(i+1)*1024].to(device)
                 nodes = mnodes[:, i*1024:(i+1)*1024]
-
-                if torch.abs(torch.mean(y)) < 0.3:
-                    continue
 
                 nodes = nodes.to(device)
                 y = y.to(device)
@@ -270,17 +287,27 @@ def test(cfg, out, n_points, model_size, inputs, train=True, testing_train=False
                 # # FLOPs:93.456 KFLOPS  MACs:46.512 KMACs  Params:1.158 K
                 # # FLOPs:3.552 KFLOPS  MACs:1.728 KMACs  Params:642
                 # exit()
+                
+                l1_elements = (o - y) ** 2
+                loss = torch.sqrt(torch.mean(l1_elements))
+                corr = pearson_corrcoef(
+                    o.flatten(),
+                    y.flatten()
+                )
+                mean_corr = corr.mean()
+                cvalid = torch.mean(valid.float(), dim=-1)
+                if torch.sum(cvalid > 0) == 0:
+                    continue
 
-                # plot_graph(o, y, x)
+                min_d = torch.min(torch.mean(torch.abs(y.unsqueeze(1) - x), dim=-1), dim=-1)[0]
+                results[idx]['corr'].append(mean_corr.item())
+                results[idx]['loss'].append(loss.item())
+                results[idx]['best'].append(min_d.item())
+                results[idx]['mean'].append(torch.mean(torch.abs(y)).item())
 
-                l1_elements = torch.abs(o - y.unsqueeze(1))
-                loss = torch.mean(l1_elements)
+                if x.shape[1] == 5:
+                    plot_graph(o, y, x)
 
-                ploss = torch.abs(o - y.unsqueeze(1)) / (y.unsqueeze(1) + 1e-8)
-                ploss = torch.mean(ploss)
-                results[idx]['loss-p'] += ploss.item()
-                results[idx]['loss'] += loss.item()
-                results[idx]['count'] += 1
             print(f'Elapsed: {time.time() - start}')
 
     rn = cfg.model['target']
@@ -306,7 +333,7 @@ def main():
     inputs = 'pte'
     with open("log-test-all.txt", "w") as f:
         station_name = f'S32-{8}'
-        test(cfg, station_name, 16, model_size=model_size, inputs=inputs, train=True)
+        # test(cfg, station_name, 16, model_size=model_size, inputs=inputs, train=True)
         test(cfg, station_name, 10, model_size=model_size, inputs=inputs, train=False)
 
 

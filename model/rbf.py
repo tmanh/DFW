@@ -12,7 +12,7 @@ class RBF(nn.Module):
     def __init__(self, in_dim, n_layers, n_dim, fmts):
         super().__init__()
 
-    def forward(self, xs, x, inputs, train, stage):
+    def forward(self, xs, x, valid, inputs, train=False, stage=-1):
         out = torch.zeros((x.shape[0], x.shape[2]), device=x.device)
         for b in range(xs.shape[0]):
             for i in range(x.shape[2]):
@@ -23,7 +23,7 @@ class RBF(nn.Module):
                 if lv.shape[0] > 1:
                     rbf = Rbf(
                         lx, ly, lv,
-                        function='multiquadric'
+                        function='thin_plate'
                     )
                 
                     # Interpolation at the target point
