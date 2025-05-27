@@ -225,7 +225,7 @@ def test(cfg, train=True):
 
     train_dataset = WaterDatasetX(
         path='data/selected_stats_rainfall_segment.pkl', train=True,
-        selected_stations=good_nb_extended, testing_stations=test_nb
+        selected_stations=good_nb_extended
     )
     train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
 
@@ -276,32 +276,36 @@ def test(cfg, train=True):
         } for k in range(len(list(test_dataset.data.keys())))
     }
 
+    # for idx, (mxs, my, mlrain, mnbxs, mnby, mnrain) in enumerate(test_loader):
+    #     pass
+    # exit()
+
+    seg_len = 168
     with torch.no_grad():
         for idx, (mxs, my, mlrain, mnbxs, mnby, mnrain) in enumerate(test_loader):
             outs = []
             tgts = []
-            for i in range(my.shape[-1] // 168):
-                y = my[:, i*168:(i+1)*168].detach().cpu().numpy()
-                nby = mnby[:, :, i*168:(i+1)*168].detach().cpu().numpy()
+            for i in range(my.shape[-1] // seg_len):
+                y = my[:, i*seg_len:(i+1)*seg_len].detach().cpu().numpy()
+                nby = mnby[:, :, i*seg_len:(i+1)*seg_len].detach().cpu().numpy()
                 nxs = mnbxs.detach().cpu().numpy()
                 xs = mxs.detach().cpu().numpy()
-                lrain = mlrain[:, i*168:(i+1)*168].detach().cpu().numpy()
-                nrain = mnrain[:, :, i*168:(i+1)*168].detach().cpu().numpy()
+                lrain = mlrain[:, i*seg_len:(i+1)*seg_len].detach().cpu().numpy()
+                nrain = mnrain[:, :, i*seg_len:(i+1)*seg_len].detach().cpu().numpy()
                 
                 y = np.expand_dims(y[0], axis=-1)
                 xs = xs.repeat(y.shape[0], axis=0)
                 lrain = np.expand_dims(lrain[0], axis=-1)
                 all_xs = np.concatenate([xs, lrain], axis=-1)
 
-                if not has_significant_slope(y):
+                if not has_significant_slope(y[:, 0]):
                     continue
 
                 nby = np.expand_dims(nby[0], axis=-1).transpose(1, 0, 2)
                 nxs = nxs.repeat(y.shape[0], axis=0)
                 nrain = np.expand_dims(nrain[0], -1).transpose(1, 0, 2)
                 all_nxs = np.concatenate([nxs, nrain], axis=-1)
-                print(all_nxs.shape, nby.shape)
-                exit()
+
                 o = model.predict(all_nxs, nby, all_xs)[:, 0]
 
                 # print(o.shape, x.shape, y.shape)
@@ -332,14 +336,13 @@ def test(cfg, train=True):
                     y.flatten()
                 )
 
-                # plot_graph(o, y, nby[:, :3])
+                # if y.max() > 1.0 and y.max() < 4.0:
+                #     plot_graph(o, y, nby[:, :3])
 
             outs = np.array(outs)
             tgts = np.array(tgts)
             if outs.shape[0] > 0:
                 se = (outs - tgts) ** 2
-                print(np.mean(se))
-
                 corr = pearson_corrcoef(
                     outs,
                     tgts
@@ -347,7 +350,6 @@ def test(cfg, train=True):
                 results[idx]['corr'].append(corr)
                 results[idx]['loss'].append(se)
                 results[idx]['mean'].append(tgts)
-
 
     with open(f'{ckpt_name}-results.pkl', 'wb') as f:
         pickle.dump(results, f)

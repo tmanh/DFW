@@ -60,7 +60,7 @@ class GATWithEdgeAttr(torch.nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels, heads=1):
         super(GATWithEdgeAttr, self).__init__()
         hidden_channels = 48
-        edge_dim = 18
+        edge_dim = 17
         self.hidden_channels = hidden_channels
         self.fuse_mlp = nn.Linear(3, 1)
         self.gat = EdgeAttrGNNLayer(hidden_channels, edge_dim=edge_dim, out_channels=hidden_channels)

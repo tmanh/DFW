@@ -357,6 +357,12 @@ class WaterDataset(Dataset):
             # test
             (50.9761639541252, 3.50350061937995),
             (50.967587, 3.46339),
+            (50.963005, 3.505905),
+            (50.752506, 3.6088760000000004),
+            # train
+            (50.745453, 4.345417),
+            (50.7535570834951, 4.26976461821304),
+            (50.7486391043145, 4.35302730688102),
             ###
         ]
 
@@ -400,6 +406,8 @@ class WaterDataset(Dataset):
             if len(list(new_nb.keys())) > 0 and k in selected_stations and k not in self.invalid_list:
                 self.using_keys.append(k)
 
+        self.using_keys = sorted(self.using_keys)
+
         # count = [0, 0, 0, 0, 0, 0, 0, 0]
         # for k in data.keys():
         #     if len(data[k]['values']) > 0:
@@ -434,11 +442,9 @@ class WaterDataset(Dataset):
 
     def get_neighbor_input(self, stats):
         # avg_elevation, std_elevation, max_z, mean_z, min_z, std_z
-        elevation = stats['elevation']
         distance = stats['distance']
         displacement = stats['displacement']
         delta_elevation = stats['key_elevation'] - stats['src_elevation']
-        
         src_slope = stats['src_slope']
         slope_mean = stats['slope_mean']
         slope_std = stats['slope_std']
@@ -449,6 +455,12 @@ class WaterDataset(Dataset):
         key_slope = stats['key_slope']
         key_elevation = stats['key_elevation']
         src_elevation = stats['src_elevation']
+
+        elevation = stats['elevation']
+        if isinstance(elevation, tuple) and len(elevation) == 6:
+            elevation = elevation[:5]
+        else:
+            elevation = [elevation[k] for k in elevation.keys()]
 
         xs = [
             # distance features
@@ -467,10 +479,10 @@ class WaterDataset(Dataset):
         while keep_running:
             loc_key = self.get_random_loc(idx)
             nb, loc_vals, loc_rain, nb_vals, nb_rain = self.get_time_values_from_loc(loc_key)
-            print(loc_key, len(nb))
+
             if nb is None:
-                print(loc_key)
                 idx = random.randint(0, len(self) - 1)
+                print(loc_key, 'not found')
                 continue
 
             if 'mean' not in self.data[loc_key].keys():
@@ -502,12 +514,11 @@ class WaterDataset(Dataset):
                         # distance features
                         -1, displacement[0], displacement[1],
                         # elevation features
-                        -1, -1, -1, -1, -1, -1, delta_elevation,
+                        -1, -1, -1, -1, -1, delta_elevation,
                         # slope features
                         -1, -1,
-                        -1, -1, -1, -1, -1, -1, *loc_key, *_nb
+                        -1, -1, -1, -1, -1, 0, *loc_key, *_nb
                     ]
-
                 if 'mean' not in self.data[_nb].keys():
                     self.data[_nb]['mean'] = np.mean(self.data[_nb]['values'])
                 
@@ -525,8 +536,6 @@ class WaterDataset(Dataset):
         nb_rain = np.array(nb_rain)
 
         x = np.array(nb_vals)
-        for xxx in xs:
-            print(xxx.shape)
         xs = np.array(xs)
         es = np.array(es)
 
@@ -604,13 +613,15 @@ class WaterDataset(Dataset):
 
     def get_random_loc(self, idx):
         while True:
-            idx = idx if not self.train else idx % 10 
             loc_key = self.using_keys[idx]
 
-            if len(self.data[loc_key]['week_idx']) >= self.length:
-                break
+            if self.train:
+                if len(self.data[loc_key]['week_idx']) >= self.length:
+                    break
+                else:
+                    idx = random.randint(0, len(self.using_keys) - 1)
             else:
-                idx = random.randint(0, len(self.using_keys) - 1)
+                break
         return loc_key
 
 
@@ -621,8 +632,8 @@ class GWaterDataset(WaterDataset):
             loc_key = self.get_random_loc(idx)
             nb, loc_vals, loc_rain, nb_vals, nb_rain = self.get_time_values_from_loc(loc_key)
             if nb is None:
-                print(loc_key)
                 idx = random.randint(0, len(self) - 1)
+                print(loc_key, 'not found')
                 continue
 
             updated = False
@@ -659,7 +670,7 @@ class GWaterDataset(WaterDataset):
                         # distance features
                         -1, displacement[0], displacement[1],
                         # elevation features
-                        -1, -1, -1, -1, -1, -1, delta_elevation,
+                        -1, -1, -1, -1, -1, delta_elevation,
                         # slope features
                         -1, -1,
                         -1, -1, -1, -1, -1, 0
@@ -675,9 +686,15 @@ class GWaterDataset(WaterDataset):
 
                 if not updated:
                     updated = True
-                    if 'mean' not in self.data[loc_key]:
-                        self.data[loc_key]['mean'] = np.mean(self.data[loc_key]['values'])
+
+                    if 'mean' not in self.data[loc_key].keys():
+                        all_data = np.array(self.data[loc_key]['values'])
+                        self.data[loc_key]['mean'] = np.mean(all_data)
                     loc_vals -= self.data[loc_key]['mean']
+
+                if self.train:
+                    if np.mean(np.abs(loc_vals)) <= 0.2 or np.mean(np.abs(loc_vals)) >= 4:
+                        continue
 
                 ndict = self.update_node_dict(ndict, _nb, nb_values)
                 edict[(_nb, loc_key)] = _xs
@@ -769,6 +786,7 @@ class GWaterDataset(WaterDataset):
         es = np.array(es)
         es = torch.tensor(es).float().unsqueeze(-1)
         src_values = torch.tensor(src_values).float() - es
+
         return torch.tensor(loc_vals), src_values, valid, graph_data
 
     def update_node_dict(self, ndict, _nb, nb_values):
@@ -778,10 +796,8 @@ class GWaterDataset(WaterDataset):
 
 
 class WaterDatasetX(WaterDataset):
-    def __init__(self, path, train=False, selected_stations=None, testing_stations=None): # ='tdata'
+    def __init__(self, path, train=False, selected_stations=None): # ='tdata'
         super().__init__(path, train, selected_stations)
-
-        self.testing_stations = testing_stations
 
         new_using_keys = []
         for k in self.using_keys:
@@ -841,13 +857,19 @@ class WaterDatasetX(WaterDataset):
     
 
 class WaterDatasetY(WaterDataset):
-    def __init__(self, path, train=False, selected_stations=None, input_type='pte', length=12 * 3, n_neighbors=4): # ='tdata'
-        super().__init__(path, train, selected_stations, input_type, length, n_neighbors)
-
     def get_time_values_from_loc(self, loc_key):
         nb = self.data[loc_key]['neighbor'].keys()
-        nb = [nb_ for nb_ in nb if nb_ in self.data.keys() and nb_ != loc_key and nb_ in self.all_using_stations]
-        selected_weeks = self.common_weeks
+        nb = [nb_ for nb_ in nb if nb_ in self.data.keys() and nb_ != loc_key]
+        common_weeks = set(self.data[loc_key]['week_idx'])
+        for _nb in nb:
+            nb_weeks = set(self.data[_nb]['week_idx'])
+            common_weeks = common_weeks.intersection(nb_weeks)
+        common_weeks = sorted(common_weeks)
+
+        if common_weeks == []:
+            return None, None, None, None, None
+
+        selected_weeks = common_weeks
 
         # Get loc data
         loc_idx = [self.data[loc_key]['week_idx'].index(w) for w in selected_weeks]

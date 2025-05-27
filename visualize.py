@@ -28,17 +28,22 @@ def collect_bin_means(result):
     all_corr = np.array(all_corr)
     corr = np.mean(all_corr) if len(all_corr) > 0 else np.nan
 
-    mask = ((all_mean < -0.2) | (all_mean > 0.2)) & (all_mean > -5)
+    mask = (all_mean > -4) & (all_mean < 4)  # Filter out extreme values
+
+    print(all_mean.shape, all_mean.min(), all_mean.max())
+
     all_mean = all_mean[mask]
     all_loss = all_loss[mask]
+    all_loss = np.abs(all_loss)
 
-    mask1 = all_mean < -1
-    mask2 = (all_mean < -0.5) & (all_mean >= -1)
-    mask3 = (all_mean < 0) & (all_mean >= -0.5)
-    mask4 = (all_mean >= 0) & (all_mean < 0.5)
-    mask5 = (all_mean >= 0.5) & (all_mean < 1.0)
-    mask6 = (all_mean >= 1)
-    bin_masks = [mask1, mask2, mask3, mask4, mask5, mask6]
+    print(all_loss.shape, all_loss.min(), all_loss.max())
+    print(all_mean.shape, all_mean.min(), all_mean.max())
+
+    mask4 = (all_mean >= 0) & (all_mean <= 0.2)
+    mask5 = (all_mean > 0.2) & (all_mean < 0.5)
+    mask6 = (all_mean >= 0.5) & (all_mean < 1.0)
+    mask7 = (all_mean >= 1)
+    bin_masks = [mask4, mask5, mask6, mask7]
 
     bin_means = []
     bin_stds = []
@@ -50,7 +55,7 @@ def collect_bin_means(result):
 
 def compare_methods_by_bin(results_dict, save_dir='./plots'):
     os.makedirs(save_dir, exist_ok=True)
-    bin_labels = ["< -1", "[-1, -0.5)", "[-0.5, 0)", "[0, 0.5)", "[0.5, 1)", ">= 1"]
+    bin_labels = ["[0, 0.2]", "(0.2, 0.5)", "[0.5, 1)", ">= 1"]
 
     method_names = []
     all_bin_means = []
@@ -113,9 +118,9 @@ def compare_methods_by_bin(results_dict, save_dir='./plots'):
 
 def load_and_log():
     results_dict = {
-        "IDW2": 'model.distance.InverseDistance2-results.pkl',
+        #"IDW2": 'model.distance.InverseDistance2-results.pkl',
         "IDW": 'model.distance.InverseDistance-results.pkl',
-        "POK": 'rainfall-OK-results.pkl',
+        "POK": 'model.nngp.SpatioTemporalNNGP.pkl-results.pkl',
         "GNN": 'g-model.gnn.GATWithEdgeAttr-results.pkl',
         "OK": 'model.kriging.OrdinaryKrigingInterpolation-results.pkl',
         "MLP": 'model.mlp.MLPW-results.pkl',

@@ -135,8 +135,8 @@ def plot_graph(o, y, x):
     # Create and save plot
     plt.figure(figsize=(12, 6))
     plt.plot(time_steps, y_np, label='Ground Truth (y)', marker='o')
-    # for i in range(x_np.shape[0]):
-    #     plt.plot(time_steps, x_np[i], label=f'Source ({i})', marker='o')
+    for i in range(x_np.shape[0]):
+        plt.plot(time_steps, x_np[i], label=f'Source ({i})', marker='o')
     plt.plot(time_steps, o_np, label='Interpolated (o)', marker='x')
     plt.title('Comparison of Ground Truth and Interpolated Time Series')
     plt.xlabel('Time Step')
@@ -209,7 +209,7 @@ def test(cfg, train=True):
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
     if train:
-        num_epochs = 1
+        num_epochs = 10
         list_loss = []
         epoch_bar = tqdm(range(num_epochs), desc="Epochs")  # tqdm for epochs
 
@@ -314,7 +314,8 @@ def test(cfg, train=True):
                     y.flatten().detach().cpu().numpy()
                 )
 
-                # plot_graph(o, y, x[:, :3])
+                # if y.max() > 1.0 and y.max() < 4.0:
+                #     plot_graph(o, y, x[:, :3])
 
             outs = np.array(outs)
             tgts = np.array(tgts)
@@ -329,7 +330,7 @@ def test(cfg, train=True):
                 results[idx]['loss'].append(se)
                 results[idx]['mean'].append(tgts)
 
-            print(f'Elapsed: {time.time() - start}')
+            # print(f'Elapsed: {time.time() - start}')
 
     rn = cfg.model['target']
     with open(f'g-{rn}-results.pkl', 'wb') as f:
