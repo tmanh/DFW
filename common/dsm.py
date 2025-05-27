@@ -2,7 +2,7 @@ import math
 import rasterio
 import numpy as np
 
-from scipy import ndimage as ndi
+from rasterio.warp import transform as rasterio_transform
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 
 
@@ -78,13 +78,14 @@ def crop_dsm(dsm, start, end, margin=50):
     return cropped_dsm, (min_row, min_col)  # Return top-left offset
 
 
-def gps_to_pixel(transform, lat, lon):
-    """ Convert GPS coordinates (lat, lon) to raster pixel (row, col). """
-    col, row = ~transform * (lon, lat)  # Apply inverse affine transform
-    row, col = int(round(row)), int(round(col))
+def gps_to_pixel(transform, lat, lon, raster_crs):
+    # Convert (lat, lon) in EPSG:4326 to raster CRS (e.g. UTM)
+    x, y = rasterio_transform("EPSG:4326", raster_crs, [lon], [lat])
+    x, y = x[0], y[0]
 
-    # print(f"GPS ({lat}, {lon}) → Pixel ({row}, {col})")  # Debugging output
-    return row, col
+    # Convert projected coordinates to pixel indices
+    col, row = ~transform * (x, y)
+    return int(round(row)), int(round(col))
 
 
 def pixel_to_gps(transform, row, col):

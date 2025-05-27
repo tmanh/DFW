@@ -20,6 +20,7 @@ from tqdm import tqdm
 
 from model.gnn import GATWithEdgeAttr
 from model.mlp import *
+from water_level import has_significant_slope, split_stations_by_clusters
 
 logging.basicConfig(filename="log-test-all-gnn.txt", level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -134,8 +135,8 @@ def plot_graph(o, y, x):
     # Create and save plot
     plt.figure(figsize=(12, 6))
     plt.plot(time_steps, y_np, label='Ground Truth (y)', marker='o')
-    for i in range(x_np.shape[0]):
-        plt.plot(time_steps, x_np[i], label=f'Source ({i})', marker='o')
+    # for i in range(x_np.shape[0]):
+    #     plt.plot(time_steps, x_np[i], label=f'Source ({i})', marker='o')
     plt.plot(time_steps, o_np, label='Interpolated (o)', marker='x')
     plt.title('Comparison of Ground Truth and Interpolated Time Series')
     plt.xlabel('Time Step')
@@ -145,7 +146,7 @@ def plot_graph(o, y, x):
     plt.tight_layout()
 
     # Save to file (you can change path/filename as needed)
-    output_path = './interpolation_vs_groundtruth.png'
+    output_path = './g_interpolation_vs_groundtruth.png'
     plt.savefig(output_path)
     plt.close()
 
@@ -158,36 +159,46 @@ def pearson_corrcoef(x, y, dim=-1, eps=1e-8):
     Compute Pearson correlation between x and y along given dimension.
     Assumes x and y are of the same shape.
     """
-    x_centered = x - x.mean(dim=dim, keepdim=True)
-    y_centered = y - y.mean(dim=dim, keepdim=True)
+    x_centered = x - x.mean(axis=dim, keepdims=True)
+    y_centered = y - y.mean(axis=dim, keepdims=True)
 
-    cov = (x_centered * y_centered).mean(dim=dim)
-    std_x = x_centered.std(dim=dim)
-    std_y = y_centered.std(dim=dim)
-    
+    cov = (x_centered * y_centered).mean(axis=dim)
+    std_x = x_centered.std(axis=dim)
+    std_y = y_centered.std(axis=dim)
+
     corr = cov / (std_x * std_y + eps)
     return corr
 
 
-def test(cfg, out, n_points, model_size, inputs, train=True, testing_train=False):
-    with open('data/split.pkl', 'rb') as f:
-        split = pickle.load(f)
-        good_nb_extended = split['train']
-        test_nb = split['test']
-    print('Train length: ', len(good_nb_extended))
-    print('Test length: ', len(test_nb))
+def test(cfg, train=True):
+    if not os.path.exists('data/split.pkl'):
+        with open('data/selected_stats_rainfall_segment.pkl', 'rb') as f:
+            data = pickle.load(f)
+
+        good_nb_extended, test_nb = split_stations_by_clusters(data)
+        print('Train length: ', len(good_nb_extended))
+        print('Test length: ', len(test_nb))
+        with open('data/split.pkl', 'wb') as f:
+            pickle.dump(
+                {'train': good_nb_extended, 'test': test_nb},
+                f
+            )
+    else:
+        with open('data/split.pkl', 'rb') as f:
+            split = pickle.load(f)
+            good_nb_extended = split['train']
+            test_nb = split['test']
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Define your training and testing dataset
-    train_dataset = GWaterDataset(path='data/selected_stats.pkl', train=True,
+    train_dataset = GWaterDataset(path='data/selected_stats_rainfall_segment.pkl', train=True,
         selected_stations=good_nb_extended, input_type=cfg.dataset.inputs
     )
     train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=0)  # Adjust batch_size as needed
 
     # Initialize model and wrap it with DataParallel
     model = create_model(device)
-    model.n_points = n_points
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs!")
         model = torch_geometric.nn.DataParallel(model, device_ids=[0, 1])
@@ -198,7 +209,7 @@ def test(cfg, out, n_points, model_size, inputs, train=True, testing_train=False
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
     if train:
-        num_epochs = 5
+        num_epochs = 1
         list_loss = []
         epoch_bar = tqdm(range(num_epochs), desc="Epochs")  # tqdm for epochs
 
@@ -216,7 +227,7 @@ def test(cfg, out, n_points, model_size, inputs, train=True, testing_train=False
                 o = model(nodes, edge_index, edge_attr, valid)
 
                 # Compute loss
-                loss = l1_loss(o, y)
+                loss = l1_loss(o, y)# - 0.1 * pearson_corrcoef(o, y)
 
                 # Backward pass
                 optimizer.zero_grad()
@@ -239,7 +250,7 @@ def test(cfg, out, n_points, model_size, inputs, train=True, testing_train=False
         return
 
     test_dataset = GWaterDataset(
-        path='data/selected_stats.pkl', train=False,
+        path='data/selected_stats_rainfall_segment.pkl', train=False,
         selected_stations=test_nb, input_type=cfg.dataset.inputs
     )
 
@@ -253,21 +264,29 @@ def test(cfg, out, n_points, model_size, inputs, train=True, testing_train=False
         } for k in range(len(list(test_dataset.data.keys())))
     }
 
+    seg_len = 168
     with torch.no_grad():
         for idx, (my, mx, mvalid, graph_data) in enumerate(test_loader):
             mnodes = graph_data.x.unsqueeze(-1)
             edge_index = graph_data.edge_index.to(device)
             edge_attr = graph_data.edge_attr.to(device)
             start = time.time()
-            for i in range(mx.shape[2] // 1024):
-                x = mx[:, :, i*1024:(i+1)*1024].to(device)
-                valid = mvalid[:, :, i*1024:(i+1)*1024].to(device)
-                y = my[:, i*1024:(i+1)*1024].to(device)
-                nodes = mnodes[:, i*1024:(i+1)*1024]
+            
+            outs = []
+            tgts = []
+            
+            for i in range(mx.shape[2] // seg_len):
+                x = mx[:, :, i*seg_len:(i+1)*seg_len].to(device)
+                valid = mvalid[:, :, i*seg_len:(i+1)*seg_len].to(device)
+                y = my[:, i*seg_len:(i+1)*seg_len].to(device)
+                nodes = mnodes[:, i*seg_len:(i+1)*seg_len]
 
                 nodes = nodes.to(device)
                 y = y.to(device)
                 valid = valid.to(device)
+
+                if not has_significant_slope(y[0].detach().cpu().numpy()):
+                    continue
 
                 # Forward pass
                 o = model(nodes, edge_index, edge_attr, valid)
@@ -288,30 +307,32 @@ def test(cfg, out, n_points, model_size, inputs, train=True, testing_train=False
                 # # FLOPs:3.552 KFLOPS  MACs:1.728 KMACs  Params:642
                 # exit()
                 
-                l1_elements = (o - y) ** 2
-                loss = torch.sqrt(torch.mean(l1_elements))
-                corr = pearson_corrcoef(
-                    o.flatten(),
-                    y.flatten()
+                outs.extend(
+                    o.flatten().detach().cpu().numpy()
                 )
-                mean_corr = corr.mean()
-                cvalid = torch.mean(valid.float(), dim=-1)
-                if torch.sum(cvalid > 0) == 0:
-                    continue
+                tgts.extend(
+                    y.flatten().detach().cpu().numpy()
+                )
 
-                min_d = torch.min(torch.mean(torch.abs(y.unsqueeze(1) - x), dim=-1), dim=-1)[0]
-                results[idx]['corr'].append(mean_corr.item())
-                results[idx]['loss'].append(loss.item())
-                results[idx]['best'].append(min_d.item())
-                results[idx]['mean'].append(torch.mean(torch.abs(y)).item())
+                # plot_graph(o, y, x[:, :3])
 
-                if x.shape[1] == 5:
-                    plot_graph(o, y, x)
+            outs = np.array(outs)
+            tgts = np.array(tgts)
+            if outs.shape[0] > 0:
+                se = (outs - tgts) ** 2
+
+                corr = pearson_corrcoef(
+                    outs,
+                    tgts
+                )
+                results[idx]['corr'].append(corr)
+                results[idx]['loss'].append(se)
+                results[idx]['mean'].append(tgts)
 
             print(f'Elapsed: {time.time() - start}')
 
     rn = cfg.model['target']
-    with open(f'g-{rn}-{cfg.model.params.fmts}-results.pkl', 'wb') as f:
+    with open(f'g-{rn}-results.pkl', 'wb') as f:
         pickle.dump(results, f)
 
 
@@ -323,28 +344,15 @@ def main():
     random.seed(42)  # For reproducibility
 
     parser = argparse.ArgumentParser(description="Run the test function with configurable parameters.")
-    parser.add_argument("--cfg", type=str, help="Config file path", default="config/gru_32_1_io.yaml")
+    parser.add_argument("--cfg", type=str, help="Config file path", default="config/gnn.yaml")
     parser.add_argument("--training", action="store_true", help="Enable training mode (default: False)")
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.cfg)
 
-    model_size = 'gnn'
-    inputs = 'pte'
     with open("log-test-all.txt", "w") as f:
-        station_name = f'S32-{8}'
-        # test(cfg, station_name, 16, model_size=model_size, inputs=inputs, train=True)
-        test(cfg, station_name, 10, model_size=model_size, inputs=inputs, train=False)
-
-
-def save_results(log, out, l1, list_l1, list_values):
-    log.write(f'{out} {l1.item()}\n')
-    print(f'{out} {l1.item()}')
-
-    # Example usage
-    # Assuming `times` and `list_values` are already populated from your code
-    plot_predictions_with_time(list_l1, save_path=f'{out}-l1.png')
-    plot_predictions_with_time(list_values, save_path=f'{out}-series.png')
+        # test(cfg, train=True)
+        test(cfg, train=False)
 
 
 main()

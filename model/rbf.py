@@ -9,10 +9,10 @@ from scipy.interpolate import Rbf
 # Displacement
 # TODO: distance, slope, elevation diff
 class RBF(nn.Module):
-    def __init__(self, in_dim, n_layers, n_dim, fmts):
+    def __init__(self, in_dim, n_layers, n_dim):
         super().__init__()
 
-    def forward(self, xs, x, valid, inputs, train=False, stage=-1):
+    def forward(self, xs, x, lrain, nrain, valid):
         out = torch.zeros((x.shape[0], x.shape[2]), device=x.device)
         for b in range(xs.shape[0]):
             for i in range(x.shape[2]):

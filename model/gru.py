@@ -6,6 +6,8 @@ import torch.nn.functional as F
 
 from torch.nn import Linear, Identity, Module
 
+from model.common import Mlp
+
 def exists(v):
     return v is not None
 
@@ -98,154 +100,74 @@ class minGRU(Module):
         return out, next_prev_hidden
     
 
+class SensorEncoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim):
+        super(SensorEncoder, self).__init__()
+        self.time_encoder = nn.GRU(66, hidden_dim, batch_first=True)
+        self.pos_encoder = nn.Linear(input_dim, hidden_dim)  # distance or other static features
+        self.fc = nn.Linear(2 * hidden_dim, hidden_dim)
+
+    def forward(self, x, pos):
+        """
+        x: (batch, sensors, time, features)
+        pos: (batch, sensors, 1) - distance or other static info
+        """
+        B, S, T, F = x.shape
+        
+        feats = x.view(B * S, T, F)
+        
+        _, h = self.time_encoder(feats)  # h: (1, B*S, H)
+        h = h.view(B, S, -1)
+        
+        pos_emb = self.pos_encoder(pos) # (B, S, pos_dim)
+        combined = torch.cat([h, pos_emb], dim=-1)
+        
+        return self.fc(combined)  # (B, S, hidden_dim)
+
+
+class AttentionFusion(nn.Module):
+    def __init__(self, hidden_dim):
+        super(AttentionFusion, self).__init__()
+        self.query = nn.Linear(hidden_dim, hidden_dim)
+        self.key = nn.Linear(hidden_dim, hidden_dim)
+        self.scale = hidden_dim ** 0.5
+
+    def forward(self, encoded_sensors, x):
+        """
+        encoded_sensors: (B, S, H)
+        """
+        Q = self.query(encoded_sensors[:, 0:1])  # query from first sensor or dummy (B, 1, H)
+        K = self.key(encoded_sensors)  # (B, S, H)
+
+        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale  # (B, 1, S)
+        attn_weights = torch.softmax(attn_scores, dim=-1)  # (B, 1, S)
+        print(attn_weights.shape, x.shape)
+        exit()
+        context = torch.matmul(attn_weights, x.permute(2, 1, 0))  # (B, 1, H)
+        return context.squeeze(1)  # (B, H)
+
+
 class GRU(nn.Module):
-    def __init__(self, in_dim, n_layers, n_dim, fmts):
-        super().__init__()
-        self.in_dim = in_dim
-        self.n_dim = n_dim
-        self.out_dim = 1
-        self.fmts = fmts
-
-        self.in_mlp = nn.Sequential(
-            nn.Linear(in_dim, n_dim),
+    def __init__(self, in_dim=1, n_dim=64):
+        super(GRU, self).__init__()
+        self.encoder = SensorEncoder(in_dim, n_dim)
+        self.attn = AttentionFusion(n_dim)
+        self.decoder = nn.Sequential(
+            nn.Linear(n_dim, n_dim),
             nn.ReLU(),
+            nn.Linear(n_dim, 1)
         )
+
+    def forward(self, xs, x, lrain, nrain, valid):
+        """
+        x: (B, S, T, F) - sensor time series
+        pos: (B, S, 1) - sensor distances
+        """
+        sensor_repr = self.encoder(x, xs)  # (B, S, H)
+
+        B, S, C = sensor_repr.shape
+
+        fused = self.attn(sensor_repr, x)  # (B, H)
+        fused = fused.view(B, -1, 1)
         
-        modules = []
-        for _ in range(n_layers):
-            modules.extend(
-                [
-                    minGRU(dim=n_dim),
-                    nn.Dropout(p=0.1),
-                ]
-            )
-
-        if 'wo' in fmts:
-            self.out_dim = 2
-
-        self.dist = nn.Sequential(
-            *modules,
-        )
-        
-        self.out = nn.Linear(in_features=n_dim, out_features=1)
-        self.weight = nn.Linear(in_features=n_dim, out_features=1)
-
-    def forward_wo(self, x, xs):
-        outs, weights = self.step_wo(x, xs)
-        return torch.sum(outs * weights, dim=1)
-    
-    def forward_w(self, xs, x):
-        weights = self.step(xs)
-        return torch.sum(
-            x * torch.softmax(weights, dim=1),
-            dim=1,
-            keepdim=True
-        )
-
-    def forward_o(self, x, xs):
-        return self.step(x, xs)
-
-    def forward(self, xs, x, inputs, train, stage):
-        if train:
-            if self.fmts == 'w':
-                return self.forward_w(xs, x)
-            elif 'i' not in self.fmts:
-                if stage == 1:
-                    return self.forward_o(x, xs)
-                elif stage == 2:
-                    return self.forward_wo(x, xs)
-            elif 'i' in self.fmts:
-                return self.forward_o(x, xs)
-        else:
-            if self.fmts == 'w':
-                return self.forward_w(xs, x)
-            elif self.fmts == 'o':
-                return self.forward_o(x, xs)
-            elif self.fmts == 'wo':
-                return self.forward_wo(x, xs)
-            elif self.fmts == 'io':
-                return self.forward_io(xs, x, inputs)
-            else:
-                raise ValueError('Invalid format')
-
-    def forward_io(self, xs, x, inputs):
-        weights = 1 / xs[:, :, 0:1]
-
-        outs, pweights = self.step_wo(x, xs)
-
-        ixs = get_i_inputs(xs, inputs)
-        iouts = self.forward_o(outs, ixs)
-
-        return selective_blend(x, iouts, outs, weights, pweights)
-    
-    def step_wo(self, x, xs):
-        x = x.unsqueeze(-1)
-        xs = xs.unsqueeze(-2).repeat(1, 1, x.shape[2], 1)
-        xs = torch.cat([x, xs], dim=-1)
-
-        feats = self.in_mlp(xs)
-        B, N, L, C = feats.shape
-        feats = feats.permute(0, 2, 1, 3).view(B * L, N, C)
-        feats = self.dist(feats)
-        feats = feats.view(B, L, N, C).permute(0, 2, 1, 3)
-        outs = (self.out(feats) + x).squeeze(-1)
-        weights = self.weight(feats).squeeze(-1)
-        
-        weights = torch.softmax(weights, dim=1)
-
-        return outs, weights
-    
-    def step(self, x, xs):
-        x = x.unsqueeze(-1)
-        xs = xs.unsqueeze(-2).repeat(1, 1, x.shape[2], 1)
-
-        xs = torch.cat([x, xs], dim=-1)
-
-        feats = self.in_mlp(xs)
-        B, N, L, C = feats.shape
-        feats = feats.permute(0, 2, 1, 3).view(B * L, N, C)
-        feats = self.dist(feats)
-        feats = feats.view(B, L, N, C).permute(0, 2, 1, 3)
-        outs = (self.out(feats) + x).squeeze(-1)
-
-        return outs
-
-    def freeze(self):
-        for param in self.in_mlp.parameters():
-            param.requires_grad = False
-        for param in self.dist.parameters():
-            param.requires_grad = False
-        for param in self.out.parameters():
-            param.requires_grad = False
-        self.in_mlp.eval()
-        self.dist.eval()
-        self.out.eval()
-
-    def unfreeze(self):
-        for param in self.in_mlp.parameters():
-            param.requires_grad = True
-        for param in self.dist.parameters():
-            param.requires_grad = True
-        for param in self.out.parameters(): 
-            param.requires_grad = True
-        self.in_mlp.train()
-        self.dist.train()
-        self.out.train()
-
-
-def get_i_inputs(xs, inputs):
-    if inputs == 'update':
-        ixs = torch.cat(
-            [
-                xs[:, :, 0:1],    # distance
-                -xs[:, :, 1:2],   # displacement[0]
-                -xs[:, :, 2:3],   # displacement[1]
-                xs[:, :, 3:9],    # elevations stats
-                -xs[:, :, 9:10],  # elevation diff
-                xs[:, :, 11:12],  # key slope
-                xs[:, :, 10:11],  # slope
-                xs[:, :, 12:],    # slope stats
-            ], dim=2
-        )
-    
-    return ixs
+        return fused  # (B, output_len)

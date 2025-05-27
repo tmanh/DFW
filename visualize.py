@@ -1,3 +1,4 @@
+from functools import reduce
 import os
 import logging
 import pickle
@@ -12,138 +13,130 @@ if os.path.exists('log-test-all.txt'):
 logging.basicConfig(filename="log-test-all.txt", level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-def plot_error_distribution(errors, label=None, kind='hist', save_path=None):
-    """
-    Save the distribution plot of a list of errors.
-
-    Parameters:
-    - errors (list or array): List of error values.
-    - label (str): Optional label for plot title.
-    - kind (str): 'hist', 'box', or 'violin'.
-    - save_path (str): File path to save the plot (e.g., 'plots/kc_025.png').
-                       If None, nothing is saved.
-    """
-    if save_path is None:
-        return  # silently skip if no save path provided
-
-    counts, bins = np.histogram(errors, bins=100)
-    probs = counts / counts.sum()  # normalize to sum = 1
-    bin_centers = 0.5 * (bins[:-1] + bins[1:])
-    
-    plt.figure(figsize=(10, 4))
-    plt.bar(bin_centers, probs, width=(bins[1] - bins[0]), edgecolor='black', alpha=0.7)
-    
-    # plt.xlim(0, 1.0)  # Zoom in to range where most errors lie
-    # plt.xticks(np.arange(0, 100, 0.1))  # Tick marks at 0.0, 0.1, ..., 1.0
-    
-    plt.xlabel("Error Value")
-    plt.ylabel("Relative Frequency")
-    plt.title(f"Normalized Histogram for {label}")
-    # plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
-
-
-def analyze_error_brackets(result, method="default", save_dir="./plots"):
-    all_corr = []
+def collect_bin_means(result):
     all_mean = []
-    all_best = []
     all_loss = []
-
-    # Flatten values across keys
+    all_corr = []
     for k in result.keys():
-        all_corr.extend(result[k]['corr'])
-        all_mean.extend(result[k]['mean'])  # GT values
-        all_best.extend(result[k]['best'])  # Nearest-station prediction
-        all_loss.extend(result[k]['loss'])  # Interpolated errors
-        if len(result[k]['best']) > 0:
-            print(len(result[k]['best']), np.min(result[k]['best']), np.max(result[k]['best']))
-        else:
-            print(0, 0, 0)
-    all_corr = np.array(all_corr)
+        if result[k]['corr']:
+            all_corr.append(result[k]['corr'])
+            all_mean.extend(result[k]['mean'][0].tolist())
+            all_loss.extend(result[k]['loss'][0].tolist())
+
     all_mean = np.array(all_mean)
-    all_best = np.array(all_best)
     all_loss = np.array(all_loss)
+    all_corr = np.array(all_corr)
+    corr = np.mean(all_corr) if len(all_corr) > 0 else np.nan
 
-    # Bin 1: mean < 0.2
-    mask_bin1 = all_mean < 0.2
-    bin_masks = [mask_bin1]
+    mask = ((all_mean < -0.2) | (all_mean > 0.2)) & (all_mean > -5)
+    all_mean = all_mean[mask]
+    all_loss = all_loss[mask]
 
-    # Remaining values: mean ≥ 0.2
-    remaining_mean = all_mean[~mask_bin1]
-    if len(remaining_mean) > 0:
-        mean_qs = np.quantile(remaining_mean, [0.25, 0.5, 0.75])
-        prev = 0.2
-        for q in mean_qs:
-            mask = (all_mean >= prev) & (all_mean < q)
-            bin_masks.append(mask)
-            prev = q
-        # Final bin: >= last quantile
-        mask = (all_mean >= mean_qs[-1])
-        bin_masks.append(mask)
+    mask1 = all_mean < -1
+    mask2 = (all_mean < -0.5) & (all_mean >= -1)
+    mask3 = (all_mean < 0) & (all_mean >= -0.5)
+    mask4 = (all_mean >= 0) & (all_mean < 0.5)
+    mask5 = (all_mean >= 0.5) & (all_mean < 1.0)
+    mask6 = (all_mean >= 1)
+    bin_masks = [mask1, mask2, mask3, mask4, mask5, mask6]
 
-    logging.info(f'{method} — Total samples: {len(all_mean)}')
-
-    for i, mask in enumerate(bin_masks):
-        mean_subset = all_mean[mask]
-        best_subset = all_best[mask]
+    bin_means = []
+    bin_stds = []
+    for mask in bin_masks:
         loss_subset = all_loss[mask]
-        corr_subset = all_corr[mask]
+        bin_means.append(np.mean(loss_subset) if len(loss_subset) > 0 else np.nan)
+        bin_stds.append(np.std(loss_subset) if len(loss_subset) > 0 else 0)
+    return bin_means, bin_stds, corr, all_mean, bin_masks
 
-        bin_range = f"mean_bin{i+1}"
-        mean_gt = mean_subset.mean() if len(mean_subset) > 0 else np.nan
-        logging.info(f"{bin_range}, count = {len(mean_subset)}, mean of GT = {mean_gt:.4f}")
+def compare_methods_by_bin(results_dict, save_dir='./plots'):
+    os.makedirs(save_dir, exist_ok=True)
+    bin_labels = ["< -1", "[-1, -0.5)", "[-0.5, 0)", "[0, 0.5)", "[0.5, 1)", ">= 1"]
 
-        # Compute quantiles for best values in this mean bin
-        if len(best_subset) == 0:
-            continue
+    method_names = []
+    all_bin_means = []
+    all_bin_stds = []
+    all_corrs = []
 
-        best_qs = np.quantile(best_subset, [0.25, 0.5, 0.75])
-        for j, (min_b, max_b) in enumerate(zip([ -np.inf] + list(best_qs), list(best_qs) + [np.inf])):
-            bmask = (best_subset > min_b) & (best_subset <= max_b)
-            losses = loss_subset[bmask]
-            corres = corr_subset[bmask]
-            gt_vals = mean_subset[bmask]
+    for method, result in results_dict.items():
+        bin_means, bin_stds, corr, all_mean, bin_masks = collect_bin_means(result)
+        all_bin_means.append(bin_means)
+        all_bin_stds.append(bin_stds)
+        all_corrs.append(corr)
+        method_names.append(method)
 
-            bin_tag = f"{method}_mean{i+1}_best{j+1}"
-            os.makedirs(save_dir, exist_ok=True)
-            save_path = f"{save_dir}/{bin_tag}.png"
-            plot_error_distribution(errors=losses, label=bin_tag, save_path=save_path)
+    all_bin_means = np.array(all_bin_means)  # (n_methods, n_bins)
+    all_bin_stds = np.array(all_bin_stds)    # (n_methods, n_bins)
 
-            if len(losses) > 0:
-                mean_cor = np.mean(corres)
-                mean_err = np.mean(losses)
-                std_err = np.std(losses)
-                mean_gt_bin = np.mean(gt_vals)
-                logging.info(
-                    f"  Best bin {j+1}: ({min_b:.2f}, {max_b:.2f}] — count = {len(losses)}, "
-                    f"mean_cor = {mean_cor}, mean err = {mean_err:.4f}, std = {std_err:.4f}, mean GT = {mean_gt_bin:.4f}"
-                )
-            else:
-                logging.info(f"  Best bin {j+1}: ({min_b:.2f}, {max_b:.2f}] — count = 0")
+    # After all_bin_means and all_bin_stds are ready
+    x = np.arange(len(method_names))
+    
+    for b in range(len(bin_labels)):
+        plt.figure(figsize=(7, 6))
+        means = all_bin_means[:, b]
+        stds = all_bin_stds[:, b]
 
-    logging.info('\n')
+        # Get GT stats for this bin
+        gt_mask = bin_masks[b]
+        gt_vals = all_mean[gt_mask]
+        gt_min = np.nanmin(gt_vals) if len(gt_vals) > 0 else float('nan')
+        gt_mean = np.nanmean(gt_vals) if len(gt_vals) > 0 else float('nan')
+        gt_max = np.nanmax(gt_vals) if len(gt_vals) > 0 else float('nan')
+        plt.xticks(fontsize=15)
+        plt.yticks(fontsize=15)
+        plt.bar(
+            x, 
+            means, 
+            yerr=stds, 
+            capsize=8, 
+            tick_label=method_names, 
+            alpha=0.85, 
+            color=plt.cm.tab10.colors[:len(method_names)]
+        )
+        plt.ylabel("Mean Error", fontsize=15)
+        plt.title(f"Mean Error ± Std for Bin: {bin_labels[b]}", fontsize=15)
+        plt.suptitle(
+            f"GT min: {gt_min:.2f} | GT mean: {gt_mean:.2f} | GT max: {gt_max:.2f}",
+            x=0.5, y=0.97, ha='center', fontsize=15, color='black'
+        )
 
+        plt.ylim([
+            np.nanmin(means - stds) - 0.1 * np.nanmax(np.abs(means - stds)),
+            np.nanmax(means + stds) + 0.1 * np.nanmax(np.abs(means + stds))
+        ])
+        plt.tight_layout()
+        plt.savefig(f"{save_dir}/mean_error_bin_{b+1}_{bin_labels[b].replace(' ', '').replace('[','').replace(']','').replace(',','_').replace('<','lt').replace('>=','gte').replace('-','m')}.png")
+        plt.close()
 
-def load_and_log(path, method):
-    with open(path, 'rb') as f:
-        result = pickle.load(f)
+    # Print or log correlation for each method
+    for method, corr in zip(method_names, all_corrs):
+        print(f"{method}: Overall correlation = {corr:.4f}")
 
-    logging.info(f'{path}')
-    analyze_error_brackets(result, method)
-    print('----')
+def load_and_log():
+    results_dict = {
+        "IDW2": 'model.distance.InverseDistance2-results.pkl',
+        "IDW": 'model.distance.InverseDistance-results.pkl',
+        "POK": 'rainfall-OK-results.pkl',
+        "GNN": 'g-model.gnn.GATWithEdgeAttr-results.pkl',
+        "OK": 'model.kriging.OrdinaryKrigingInterpolation-results.pkl',
+        "MLP": 'model.mlp.MLPW-results.pkl',
+    }
+    for k in list(results_dict.keys()):
+        with open(results_dict[k], 'rb') as f:
+            results_dict[k] = pickle.load(f)
+
+    compare_methods_by_bin(results_dict)
 
 
 folder = './'
 
-# load_and_log(os.path.join(folder, 'bk_checkpoint_all/model.mlp.MLPW-wo-results.pkl'))
-# load_and_log(os.path.join(folder, 'bk_checkpoint_all/g-model.gru.GRU-io-results.pkl'))
-# load_and_log(os.path.join(folder, 'bk_checkpoint_all/model.distance.InverseDistance-o-results.pkl'))
-# load_and_log(os.path.join(folder, 'bk_checkpoint_all/model.kriging.OrdinaryKrigingInterpolation-o-results.pkl'))
+load_and_log()
+# load_and_log(os.path.join(folder, 'model.mlp.MLP-results.pkl'), 'mlp')
 
-load_and_log(os.path.join(folder, 'model.mlp.MLPW-wo-results.pkl'), 'mlp')
-load_and_log(os.path.join(folder, 'g-model.gru.GRU-io-results.pkl'), 'gnn')
-load_and_log(os.path.join(folder, 'model.distance.InverseDistance-o-results.pkl'), 'idw')
-load_and_log(os.path.join(folder, 'model.kriging.OrdinaryKrigingInterpolation-o-results.pkl'), 'ok')
-load_and_log(os.path.join(folder, 'model.rbf.RBF-o-results.pkl'), 'rbf')
+# load_and_log(os.path.join(folder, 'model.kriging.OrdinaryKrigingInterpolation-results.pkl'), 'ok')
+# load_and_log(os.path.join(folder, 'model.mlp.MLPW-results.pkl'), 'mlpw')
+# # load_and_log(os.path.join(folder, 'model.mlp.MLPRW-results.pkl'), 'mlprw')
+# # load_and_log(os.path.join(folder, 'model.mlp.MLPR-results.pkl'), 'mlpr')
+# load_and_log(os.path.join(folder, 'g-model.gnn.GATWithEdgeAttr-results.pkl'), 'gnn')
+# load_and_log(os.path.join(folder, 'model.distance.InverseDistance-results.pkl'), 'idw')
+# # load_and_log(os.path.join(folder, 'model.kriging.UniversalKrigingInterpolation-results.pkl'), 'uk')
+# load_and_log(os.path.join(folder, 'model.nngp.SpatioTemporalNNGP.pkl-results.pkl'), 'nngp')

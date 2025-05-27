@@ -19,7 +19,15 @@ class EdgeAttrGNNLayer(MessagePassing):
             torch.nn.Linear(out_channels, out_channels),
             torch.nn.ReLU(inplace=True)
         )
-        self.gru = minGRU(dim=out_channels)
+        self.gru = nn.Sequential(
+            torch.nn.Linear(out_channels, out_channels),
+            torch.nn.GELU(),
+        )
+        #minGRU(dim=out_channels)
+        # nn.Sequential(
+        #     torch.nn.Linear(out_channels, out_channels),
+        #     torch.nn.GELU(),
+        # ) # minGRU(dim=out_channels)
         self.weight_mlp = torch.nn.Linear(out_channels, 1)
 
     def forward(self, x, edge_index, edge_attr, valid):
@@ -39,7 +47,8 @@ class EdgeAttrGNNLayer(MessagePassing):
         edge_attr = self.weight_mlp(edge_attr)
         edge_attr = torch.mean(x_j[:, x_j.shape[-1]//2:], dim=-1, keepdim=True) * edge_attr
         
-        weights = softmax(edge_attr, index)  # shape: [num_edges, out_channels]
+        weights = torch.sigmoid(edge_attr)
+        # weights = softmax(edge_attr, index)  # shape: [num_edges, out_channels]
 
         return x_j * weights  # element-wise multiplication info
 
@@ -50,27 +59,22 @@ class EdgeAttrGNNLayer(MessagePassing):
 class GATWithEdgeAttr(torch.nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels, heads=1):
         super(GATWithEdgeAttr, self).__init__()
-        hidden_channels = 16
+        hidden_channels = 48
         edge_dim = 18
         self.hidden_channels = hidden_channels
-        self.in_mlp = nn.Sequential(
-            nn.Linear(1, hidden_channels),
-            nn.GELU(),
-        )
         self.fuse_mlp = nn.Linear(3, 1)
         self.gat = EdgeAttrGNNLayer(hidden_channels, edge_dim=edge_dim, out_channels=hidden_channels)
-        self.out_mlp = nn.Sequential(
-            nn.Linear(hidden_channels, 1),
-        )
 
     def forward(self, nodes, edge_index, edge_attr, valid):
         with torch.no_grad():
             valid = valid.squeeze(0).unsqueeze(-1)
             not_valid = 1 - valid
             nodes = nodes * valid
-        
-        N, L, C = nodes.shape
-        nodes = nodes.view(N, -1)
+
+            N, L, C = nodes.shape
+            nodes = nodes.view(N, -1)
+
+            original_nodes = nodes.clone()
 
         not_valid = not_valid.repeat(1, 1, C)
         not_valid_mask = not_valid.view(N, -1)
@@ -81,4 +85,6 @@ class GATWithEdgeAttr(torch.nn.Module):
             mask = torch.sigmoid(self.fuse_mlp(new_nodes).view(N, -1))
             
             nodes = (1 - mask) * nodes + not_valid_mask * mask * new_nodes_values[:, :new_nodes_values.shape[-1]//2]
+            valid = ((original_nodes != nodes).unsqueeze(-1) | (valid > 0)).float()
+
         return nodes[0].unsqueeze(0).squeeze(-1)

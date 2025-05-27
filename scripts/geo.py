@@ -258,11 +258,24 @@ def create_simplified_graphs(data):
 def main():
     waterways, DiG, node_ids, tree, UndiG, node2_ids, tree2 = create_waterway_graph()
 
-    with open('data/selected_stats.pkl', 'rb') as f:
+    with open('data/selected_stats_rainfall_segment.pkl', 'rb') as f:
         data = pickle.load(f)
 
-    with open('data/neighbor.pkl', 'rb') as f:
-        neighbors = pickle.load(f)
+    # with open('data/neighbor.pkl', 'rb') as f:
+    #     neighbors = pickle.load(f)
+
+    coords = np.array(list(data.keys()))  # shape (N, 2)
+    keys = list(data.keys())
+
+    # Compute pairwise L2 distances
+    dists = np.linalg.norm(coords[:, None, :] - coords[None, :, :], axis=-1)  # shape (N, N)
+
+    # For each location, get indices of 10 closest (excluding self)
+    neighbors_dict = {}
+    for i in range(len(keys)):
+        nearest = np.argsort(dists[i])[1:21]  # skip self at index 0
+        dists[i].sort()
+        neighbors_dict[keys[i]] = [keys[j] for j in nearest]
 
     if True: #'graph' not in data[list(data.keys())[0]].keys():
         for k in data.keys():
@@ -270,8 +283,7 @@ def main():
             qry2_node, _, _ = find_nearest_edge(tree2, node2_ids, k, UndiG)
 
             data[k]['graph'] = {}
-
-            for nb in neighbors[k]:
+            for nb in neighbors_dict[k]:
                 if nb not in data.keys():
                     continue
 
@@ -300,7 +312,7 @@ def main():
                     data[k]['graph'][nb]['edges'] = None
                     data[k]['graph'][nb]['nodes'] = None
 
-        with open(f'data/selected_stats.pkl', 'wb') as f:
+        with open(f'data/selected_stats_rainfall_segment.pkl', 'wb') as f:
             pickle.dump(data, f)
 
     # dict_keys(
@@ -319,9 +331,8 @@ def main():
             print("  ", edge)
         print()
 
-    with open('data/selected_stats.pkl', 'wb') as f:
+    with open('data/selected_stats_rainfall_segment.pkl', 'wb') as f:
         pickle.dump(data, f)
-    exit()
 
 
 def create_waterway_graph():

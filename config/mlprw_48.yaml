@@ -1,9 +1,9 @@
 model:
-  target: model.rbf.RBF
+  target: model.mlp.MLPRW
   params:
     in_dim: 18
-    n_layers: 1
-    n_dim: 32
+    n_layers: 2
+    n_dim: 8
 
 dataset:
   inputs: 'update'

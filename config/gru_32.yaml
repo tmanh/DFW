@@ -1,10 +1,8 @@
 model:
   target: model.gru.GRU
   params:
-    in_dim: 18
-    n_layers: 1
+    in_dim: 17
     n_dim: 32
-    fmts: 'wo'
 
 dataset:
   inputs: 'update'
