@@ -177,3 +177,6 @@ data
 
 *.jpg
 *.png
+
+*.pkl
+*.pth
