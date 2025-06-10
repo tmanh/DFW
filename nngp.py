@@ -9,6 +9,7 @@ import torch.optim as optim
 
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.signal import medfilt
 
 from sklearn.gaussian_process.kernels import RBF, Matern
 
@@ -29,8 +30,7 @@ from model.nngp import SpatioTemporalNNGP
 logging.basicConfig(filename="log-test-all.txt", level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-def plot_graph(o, y, x):
-    print(o.shape, y.shape, x.shape)
+def plot_graph(o, y, x, idx):
     # Move tensors to CPU and convert to NumPy
     o_np = o
     y_np = y
@@ -53,12 +53,12 @@ def plot_graph(o, y, x):
     plt.tight_layout()
 
     # Save to file (you can change path/filename as needed)
-    output_path = './interpolation_vs_groundtruth.png'
+    output_path = f'results/{idx}_nngp.png'
     plt.savefig(output_path)
     plt.close()
 
-    print(f"Plot saved to {output_path}")
-    input('Enter to continue: ')
+    # print(f"Plot saved to {output_path}")
+    # input('Enter to continue: ')
 
 
 def get_checkpoint_name(cfg):
@@ -192,15 +192,20 @@ def neighbor_degradation_penalty_loss(o, x, y, alpha=1.0):
     return main_loss + alpha * penalty.mean()
 
 
-def has_significant_slope(ts, window_size=3, range_thresh=0.15):
-    ts = np.array(ts)
-    if len(ts) < window_size:
-        return False
-    
-    for i in range(len(ts) - window_size + 1):
-        window = ts[i:i+window_size]
-        if (np.max(window) - np.min(window)) >= range_thresh:
-            return True  # Found significant local change
+def has_significant_slope(ts, window_size=7, range_thresh=0.2, outlier_threshold=4.0):
+    ts = pd.Series(ts)
+    filtered = medfilt(ts, kernel_size=window_size)
+    # Outlier detection
+    diff = ts - filtered
+    std = np.std(diff)
+    z_scores = diff / (std + 1e-8)
+    outlier_mask = np.abs(z_scores) > outlier_threshold
+    cleaned_ts = ts.copy()
+    cleaned_ts[outlier_mask] = filtered[outlier_mask]
+    gain = cleaned_ts.max() - cleaned_ts.min()
+
+    if gain > range_thresh:
+        return True  # Found significant local change
     return False  # No significant local change found
 
 
@@ -272,7 +277,9 @@ def test(cfg, train=True):
         k:{
             'corr': [],
             'loss': [],
-            'mean': [],
+            'gain': [],
+            'tgts': [],
+            'outs': []
         } for k in range(len(list(test_dataset.data.keys())))
     }
 
@@ -281,11 +288,16 @@ def test(cfg, train=True):
     # exit()
 
     seg_len = 168
+    total_elapsed = 0
+    total_n = 0
     with torch.no_grad():
-        for idx, (mxs, my, mlrain, mnbxs, mnby, mnrain) in enumerate(test_loader):
+        for idx, (mxs, my, mlrain, mnbxs, mnby, mnrain, loc) in enumerate(test_loader):
             outs = []
             tgts = []
+            cors = []
+            gain = []
             for i in range(my.shape[-1] // seg_len):
+                start_time = time.time()
                 y = my[:, i*seg_len:(i+1)*seg_len].detach().cpu().numpy()
                 nby = mnby[:, :, i*seg_len:(i+1)*seg_len].detach().cpu().numpy()
                 nxs = mnbxs.detach().cpu().numpy()
@@ -308,6 +320,9 @@ def test(cfg, train=True):
 
                 o = model.predict(all_nxs, nby, all_xs)[:, 0]
 
+                total_elapsed += time.time() - start_time
+                total_n += 1
+
                 # print(o.shape, x.shape, y.shape)
                 # print(o.shape, x.shape)
                 # exit()
@@ -329,27 +344,43 @@ def test(cfg, train=True):
                 # exit()
                 # o1 = idw(xs, x, inputs=cfg.dataset.inputs, train=False, stage=-1)
 
+                o = o.flatten()
+                y = y.flatten()
+
                 outs.extend(
-                    o.flatten()
+                    o
                 )
                 tgts.extend(
-                    y.flatten()
+                    y
+                )
+                cors.append(
+                    pearson_corrcoef(
+                        o,
+                        y
+                    )
+                )
+                gain.extend(
+                    (y - o).tolist()
                 )
 
-                # if y.max() > 1.0 and y.max() < 4.0:
-                #     plot_graph(o, y, nby[:, :3])
+                # if np.abs(y).max() > 0.5 and np.abs(y).max() < 1.0:
+                #     plot_graph(o, y, nby[:, :3], f'{loc.numpy()}-{idx}-{i}')
 
             outs = np.array(outs)
             tgts = np.array(tgts)
             if outs.shape[0] > 0:
                 se = (outs - tgts) ** 2
-                corr = pearson_corrcoef(
+                cor = pearson_corrcoef(
                     outs,
                     tgts
                 )
-                results[idx]['corr'].append(corr)
+                results[idx]['corr'].append(cor)
                 results[idx]['loss'].append(se)
-                results[idx]['mean'].append(tgts)
+                results[idx]['gain'].append(gain)
+                results[idx]['tgts'].append(tgts)
+                results[idx]['outs'].append(outs)
+
+    print(f'Total Elapsed: {total_elapsed:.6f} seconds, Average time per segment: {total_elapsed / total_n:.6f} seconds')
 
     with open(f'{ckpt_name}-results.pkl', 'wb') as f:
         pickle.dump(results, f)

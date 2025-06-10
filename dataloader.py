@@ -18,7 +18,7 @@ from torch_geometric.data import Data
 
 import matplotlib.pyplot as plt
 
-# import geohash
+import geohash
 
 
 def geohash_to_int_list(geohash_code):
@@ -273,6 +273,30 @@ def pearson_corrcoef(x, y, dim=-1, eps=1e-8):
     return corr
 
 
+def haversine(coord1, coord2):
+    """
+    Calculate the great-circle distance between two points on Earth (in kilometers).
+    coord1 and coord2 are (lat, lon) tuples or lists in decimal degrees.
+    """
+    # Radius of Earth in kilometers. Use 3956 for miles
+    R = 6371.0
+
+    lat1, lon1 = coord1
+    lat2, lon2 = coord2
+
+    # Convert decimal degrees to radians
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+
+    a = math.sin(dphi/2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+    distance = R * c
+    return distance
+
+
 class WaterDataset(Dataset):
     def create_segments(self, data):
         all_times = []
@@ -359,10 +383,16 @@ class WaterDataset(Dataset):
             (50.967587, 3.46339),
             (50.963005, 3.505905),
             (50.752506, 3.6088760000000004),
+            (51.148039, 3.864885),      # too few data points
+            (51.14826076428264, 3.902723574459568),  # too few data points
             # train
             (50.745453, 4.345417),
             (50.7535570834951, 4.26976461821304),
+            (50.80790167884659, 3.626698144970669),
             (50.7486391043145, 4.35302730688102),
+            (50.8296965118308, 4.00959912439749),
+            (50.87282736801505, 4.056547787684996),
+            (50.7915540177442, 3.62257299330959),
             ###
         ]
 
@@ -391,6 +421,15 @@ class WaterDataset(Dataset):
 
         self.using_keys = []
         self.data = {}
+        # max_r = 0
+        # for k in data.keys():
+            
+        #     for nb_ in data[k]['neighbor'].keys():
+        #         dist = haversine(k, nb_)
+        #         if max_r < dist:
+        #             max_r = dist
+        # print('Max distance: ', max_r)
+        # exit()
 
         for k in data.keys():
             if len(data[k]['week_idx']) < 10:
@@ -571,7 +610,7 @@ class WaterDataset(Dataset):
         #     if max_val > 0:  # Avoid division by zero
         #         xs[mask, i] = xs[mask, i] / max_val
 
-        return x, xs, y, es, loc_rain, nb_rain, valid
+        return x, xs, y, es, loc_rain, nb_rain, valid, torch.tensor(np.array(loc_key))
 
     def get_time_values_from_loc(self, loc_key):
         nb = self.data[loc_key]['neighbor'].keys()
@@ -595,8 +634,7 @@ class WaterDataset(Dataset):
         # Get loc data
         loc_idx = [self.data[loc_key]['week_idx'].index(w) for w in selected_weeks]
         loc_vals = np.array([self.data[loc_key]['values'][i] for i in loc_idx]).flatten()
-        # loc_rain = np.array([self.data[loc_key]['r1x1'][i] for i in loc_idx]).flatten()
-        loc_rain = loc_vals
+        loc_rain = np.array([self.data[loc_key]['r1x1'][i] for i in loc_idx]).flatten()
 
         # Get neighbor data
         nb_vals = []
@@ -604,10 +642,9 @@ class WaterDataset(Dataset):
         for _nb in nb:
             nb_idx = [self.data[_nb]['week_idx'].index(w) for w in selected_weeks]
             _nb_vals = np.array([self.data[_nb]['values'][i] for i in nb_idx]).flatten()
-            # _nb_rain = np.array([self.data[_nb]['r1x1'][i] for i in nb_idx]).flatten()
+            _nb_rain = np.array([self.data[_nb]['r1x1'][i] for i in nb_idx]).flatten()
             nb_vals.append(_nb_vals)
-            nb_rain.append(_nb_vals)
-            # nb_rain.append(_nb_rain)
+            nb_rain.append(_nb_rain)
 
         return nb, loc_vals, loc_rain, nb_vals, nb_rain
 
@@ -637,7 +674,19 @@ class GWaterDataset(WaterDataset):
                 continue
 
             updated = False
-            ndict = {loc_key: {'idx': 0, 'f': np.zeros_like(loc_vals).tolist()}}
+            ndict = {
+                loc_key: {
+                    'idx': 0,
+                    'f': np.zeros_like(loc_vals).tolist(),
+                    'r': loc_rain,
+                    'fx': [
+                        # self.data[loc_key]['elevation'],
+                        # self.data[loc_key]['slope'],
+                        *gps_encode(loc_key)
+                    ],
+                }
+            }
+
             edict = {}
 
             es = []
@@ -693,10 +742,11 @@ class GWaterDataset(WaterDataset):
                     loc_vals -= self.data[loc_key]['mean']
 
                 if self.train:
-                    if np.mean(np.abs(loc_vals)) <= 0.2 or np.mean(np.abs(loc_vals)) >= 4:
+                    delta = np.max(np.abs(loc_vals)) - np.min(np.abs(loc_vals))
+                    if delta <= 0.05 or delta >= 4:
                         continue
 
-                ndict = self.update_node_dict(ndict, _nb, nb_values)
+                ndict = self.update_node_dict(ndict, _nb, nb_values, nb_rain[idx])
                 edict[(_nb, loc_key)] = _xs
                 good_nb.append(_nb)
 
@@ -727,7 +777,7 @@ class GWaterDataset(WaterDataset):
                             edict[(edge[0], edge[1])] = _xs
                             prev_len = len(ndict.keys())
                             ndict = self.update_node_dict(
-                                ndict, edge[0], np.array([0 for _ in range(len(loc_vals))])
+                                ndict, edge[0], np.array([0 for _ in range(len(loc_vals))]), 0
                             )
                             if prev_len < len(ndict.keys()):
                                 valid.append(
@@ -736,7 +786,7 @@ class GWaterDataset(WaterDataset):
                                 prev_len += 1
                             
                             ndict = self.update_node_dict(
-                                ndict, edge[1], np.array([0 for _ in range(len(loc_vals))])
+                                ndict, edge[1], np.array([0 for _ in range(len(loc_vals))]), 0
                             )
                             if prev_len < len(ndict.keys()):
                                 valid.append(
@@ -746,6 +796,8 @@ class GWaterDataset(WaterDataset):
         # Convert node dictionary to tensor
         node_list = list(ndict.keys())
         x = torch.tensor(np.array([ndict[n]['f'] for n in node_list]), dtype=torch.float)
+        r = torch.tensor(np.array([ndict[n]['r'] for n in node_list if 'fx' in ndict[n].keys()]), dtype=torch.float)
+        fx = torch.tensor(np.array([ndict[n]['fx'] for n in node_list if 'fx' in ndict[n].keys()]), dtype=torch.float)
 
         edge_list = []
         # Convert edge dictionary to tensors
@@ -787,11 +839,25 @@ class GWaterDataset(WaterDataset):
         es = torch.tensor(es).float().unsqueeze(-1)
         src_values = torch.tensor(src_values).float() - es
 
-        return torch.tensor(loc_vals), src_values, valid, graph_data
+        return torch.tensor(loc_vals), src_values, valid, graph_data, fx, r, torch.tensor(np.array(loc_key)).float()
 
-    def update_node_dict(self, ndict, _nb, nb_values):
+    def update_node_dict(self, ndict, _nb, nb_values, nb_rain=None):
         if _nb not in ndict.keys():
-            ndict[_nb] = {'idx': len(ndict.keys()), 'f': nb_values}
+            if nb_rain is None:
+                ndict[_nb] = {
+                    'idx': len(ndict.keys()),
+                    'f': nb_values,
+                }
+            else:
+                ndict[_nb] = {
+                    'idx': len(ndict.keys()),
+                    'f': nb_values,
+                    'fx': [
+                        # self.data[_nb]['elevation'], self.data[_nb]['slope'],
+                        *gps_encode(_nb)
+                    ],
+                    'r': nb_rain,
+                }
         return ndict
 
 
@@ -940,8 +1006,8 @@ class WaterDatasetY(WaterDataset):
         
         nb_rain = np.array(nb_rain)
         nb_rain = torch.tensor(nb_rain).float()
-
-        return lxs, ly, loc_rain, nbxs, nby, nb_rain
+        print(loc_key)
+        return lxs, ly, loc_rain, nbxs, nby, nb_rain, torch.tensor(np.array(loc_key))
     
     def __len__(self):
         return len(self.using_keys)

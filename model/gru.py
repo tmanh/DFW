@@ -100,6 +100,51 @@ class minGRU(Module):
         return out, next_prev_hidden
     
 
+class fullGRU(nn.Module):
+    def __init__(self, dim, expansion_factor=1., proj_out=None):
+        super().__init__()
+        dim_inner = int(dim * expansion_factor)
+        self.dim = dim
+        self.dim_inner = dim_inner
+
+        # GRU needs 3 linear layers for input: reset gate, update gate, new gate
+        self.linear_x = nn.Linear(dim, dim_inner * 3, bias=False)
+        self.linear_h = nn.Linear(dim_inner, dim_inner * 3, bias=False)
+
+        proj_out = proj_out if proj_out is not None else (expansion_factor != 1.)
+        self.to_out = nn.Linear(dim_inner, dim, bias=False) if proj_out else nn.Identity()
+
+    def forward(self, x, prev_hidden=None, return_next_prev_hidden=False):
+        # x: (batch, seq, dim)
+        B, S, _ = x.shape
+        if prev_hidden is None:
+            prev_hidden = x.new_zeros(B, self.dim_inner)
+
+        outs = []
+        for t in range(S):
+            x_t = x[:, t]
+            gates_x = self.linear_x(x_t)
+            gates_h = self.linear_h(prev_hidden)
+            # chunk for reset, update, and new gates
+            rx, zx, nx = gates_x.chunk(3, dim=-1)
+            rh, zh, nh = gates_h.chunk(3, dim=-1)
+
+            reset_gate = torch.sigmoid(rx + rh)
+            update_gate = torch.sigmoid(zx + zh)
+            n = torch.tanh(nx + reset_gate * nh)
+
+            new_hidden = (1 - update_gate) * n + update_gate * prev_hidden
+            outs.append(new_hidden.unsqueeze(1))
+            prev_hidden = new_hidden
+
+        out = torch.cat(outs, dim=1)
+        out = self.to_out(out)
+
+        if not return_next_prev_hidden:
+            return out
+        return out, prev_hidden.unsqueeze(1)
+    
+
 class SensorEncoder(nn.Module):
     def __init__(self, input_dim, hidden_dim):
         super(SensorEncoder, self).__init__()

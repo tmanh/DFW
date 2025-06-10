@@ -20,12 +20,13 @@ from torch.utils.data import DataLoader
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from torchmetrics.functional import pearson_corrcoef
+from scipy.signal import medfilt
 
 
 logging.basicConfig(filename="log-test-all.txt", level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-def plot_graph(o, y, x):
+def plot_graph(o, y, x, idx):
     # Move tensors to CPU and convert to NumPy
     o_np = o.detach().cpu().numpy().flatten()
     y_np = y.detach().cpu().numpy().flatten()
@@ -50,12 +51,12 @@ def plot_graph(o, y, x):
     plt.tight_layout()
 
     # Save to file (you can change path/filename as needed)
-    output_path = './interpolation_vs_groundtruth.png'
+    output_path = f'results/{idx}.png'
     plt.savefig(output_path)
     plt.close()
 
-    print(f"Plot saved to {output_path}")
-    input('Enter to continue: ')
+    # print(f"Plot saved to {output_path}")
+    # input('Enter to continue: ')
 
 
 def get_checkpoint_name(cfg):
@@ -189,15 +190,20 @@ def neighbor_degradation_penalty_loss(o, x, y, alpha=1.0):
     return main_loss + alpha * penalty.mean()
 
 
-def has_significant_slope(ts, window_size=3, range_thresh=0.15):
-    ts = np.array(ts)
-    if len(ts) < window_size:
-        return False
-    
-    for i in range(len(ts) - window_size + 1):
-        window = ts[i:i+window_size]
-        if (np.max(window) - np.min(window)) >= range_thresh:
-            return True  # Found significant local change
+def has_significant_slope(ts, window_size=7, range_thresh=0.2, outlier_threshold=4.0):
+    ts = pd.Series(ts)
+    filtered = medfilt(ts, kernel_size=window_size)
+    # Outlier detection
+    diff = ts - filtered
+    std = np.std(diff)
+    z_scores = diff / (std + 1e-8)
+    outlier_mask = np.abs(z_scores) > outlier_threshold
+    cleaned_ts = ts.copy()
+    cleaned_ts[outlier_mask] = filtered[outlier_mask]
+    gain = cleaned_ts.max() - cleaned_ts.min()
+
+    if gain > range_thresh:
+        return True  # Found significant local change
     return False  # No significant local change found
 
 
@@ -222,6 +228,7 @@ def test(cfg, train=True):
 
     # 🔹 1️⃣ Define Device (Multi-GPU)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = 'cpu'
 
     train_dataset = WaterDataset(
         path='data/selected_stats_rainfall_segment.pkl', train=True,
@@ -244,7 +251,7 @@ def test(cfg, train=True):
         epoch_bar = tqdm(range(num_epochs), desc="Epochs")  # Initialize tqdm for epochs
         optimizer = optim.Adam(model.parameters(), lr=0.001)
         for epoch in epoch_bar:
-            for x, xs, y, kes, lrain, nrain, valid in tqdm(train_loader, desc=f"Training Epoch {epoch+1}", leave=False):
+            for x, xs, y, kes, lrain, nrain, valid, loc in tqdm(train_loader, desc=f"Training Epoch {epoch+1}", leave=False):
                 x = x.to(device)
                 xs = xs.to(device)
                 y = y.to(device)
@@ -275,6 +282,7 @@ def test(cfg, train=True):
         model.load_state_dict(torch.load(ckpt_name), strict=False)
         model.eval()
 
+    rn = cfg.model['target']
     test_dataset = WaterDataset(
         path='data/selected_stats_rainfall_segment.pkl', train=False,
         selected_stations=test_nb, input_type=cfg.dataset.inputs
@@ -284,20 +292,24 @@ def test(cfg, train=True):
         k:{
             'corr': [],
             'loss': [],
-            'best': [],
-            'mean': [],
+            'gain': [],
+            'tgts': [],
+            'outs': [],
         } for k in range(len(list(test_dataset.data.keys())))
     }
 
     seg_len = 168
+    total_elapsed = 0
+    total_n = 0
     with torch.no_grad():
-        for idx, (mx, mxs, my, _, mlrain, mnrain, mvalid) in enumerate(test_loader):
-            # print(1/mxs[:,:,0][mxs[:,:,0]>0].max(), 1/mxs[:,:,0][mxs[:,:,0]>0].min())
+        for idx, (mx, mxs, my, _, mlrain, mnrain, mvalid, loc) in enumerate(test_loader):
             start = time.time()
             outs = []
             tgts = []
-            inps = []
+            cors = []
+            gain = []
             for i in range(mx.shape[2] // seg_len):
+                start = time.time()
                 x = mx[:, :, i*seg_len:(i+1)*seg_len].to(device)
                 valid = mvalid[:, :, i*seg_len:(i+1)*seg_len].to(device)
                 xs = mxs.to(device)
@@ -310,6 +322,11 @@ def test(cfg, train=True):
                     continue
 
                 o = model(xs, x, lrain, nrain, valid)
+
+                elapsed = time.time() - start
+                total_elapsed += elapsed
+                total_n += 1
+
                 # print(o.shape, x.shape, y.shape)
                 # print(o.shape, x.shape)
                 # exit()
@@ -331,31 +348,39 @@ def test(cfg, train=True):
                 # exit()
                 # o1 = idw(xs, x, inputs=cfg.dataset.inputs, train=False, stage=-1)
 
+                o_np = o.flatten().detach().cpu().numpy()
+                y_np = y.flatten().detach().cpu().numpy()
+
                 outs.extend(
-                    o.flatten().detach().cpu().numpy()
+                    o_np
                 )
                 tgts.extend(
-                    y.flatten().detach().cpu().numpy()
+                    y_np
+                )
+                gain.extend(
+                    (y_np - o_np).tolist()
                 )
 
-                # plot_graph(o, y, x[:, :3])
+                if torch.abs(y).max() > 0.5 and torch.abs(y).max() < 1.0:
+                    plot_graph(o, y, x, f'{loc.numpy()}-{idx}-{i}_{rn}')
 
             outs = np.array(outs)
             tgts = np.array(tgts)
             if outs.shape[0] > 0:
                 se = (outs - tgts) ** 2
-
-                corr = pearson_corrcoef(
+                cor = pearson_corrcoef(
                     outs,
                     tgts
                 )
-                results[idx]['corr'].append(corr)
+
+                results[idx]['corr'].append(cor)
                 results[idx]['loss'].append(se)
-                results[idx]['mean'].append(tgts)
+                results[idx]['gain'].append(gain)
+                results[idx]['tgts'].append(tgts)
+                results[idx]['outs'].append(outs)
 
-            # print(f'Elapsed: {time.time() - start}')
+    print(f'Total Elapsed: {total_elapsed:.6f} seconds, Average time per segment: {total_elapsed / total_n:.6f} seconds')
 
-    rn = cfg.model['target']
     with open(f'{rn}-results.pkl', 'wb') as f:
         pickle.dump(results, f)
 

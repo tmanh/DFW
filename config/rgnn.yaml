@@ -1,0 +1,9 @@
+model:
+  target: model.gnn.GATWithEdgeAttrRain
+  params:
+    in_dim: 18
+    n_layers: 1
+    n_dim: 32
+
+dataset:
+  inputs: 'update'

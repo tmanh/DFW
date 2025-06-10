@@ -7,7 +7,7 @@ from torch_geometric.utils import softmax
 from torch_geometric.nn.conv import MessagePassing
 
 
-from model.gru import minGRU
+from model.gru import fullGRU, minGRU
 
 class EdgeAttrGNNLayer(MessagePassing):
     def __init__(self, in_channels, edge_dim, out_channels):
@@ -23,11 +23,6 @@ class EdgeAttrGNNLayer(MessagePassing):
             torch.nn.Linear(out_channels, out_channels),
             torch.nn.GELU(),
         )
-        #minGRU(dim=out_channels)
-        # nn.Sequential(
-        #     torch.nn.Linear(out_channels, out_channels),
-        #     torch.nn.GELU(),
-        # ) # minGRU(dim=out_channels)
         self.weight_mlp = torch.nn.Linear(out_channels, 1)
 
     def forward(self, x, edge_index, edge_attr, valid):
@@ -65,7 +60,7 @@ class GATWithEdgeAttr(torch.nn.Module):
         self.fuse_mlp = nn.Linear(3, 1)
         self.gat = EdgeAttrGNNLayer(hidden_channels, edge_dim=edge_dim, out_channels=hidden_channels)
 
-    def forward(self, nodes, edge_index, edge_attr, valid):
+    def forward(self, nodes, edge_index, edge_attr, valid, r, fx):
         with torch.no_grad():
             valid = valid.squeeze(0).unsqueeze(-1)
             not_valid = 1 - valid
@@ -85,6 +80,88 @@ class GATWithEdgeAttr(torch.nn.Module):
             mask = torch.sigmoid(self.fuse_mlp(new_nodes).view(N, -1))
             
             nodes = (1 - mask) * nodes + not_valid_mask * mask * new_nodes_values[:, :new_nodes_values.shape[-1]//2]
+            
             valid = ((original_nodes != nodes).unsqueeze(-1) | (valid > 0)).float()
+            valid[:, 0] = 0
+            not_valid = 1 - valid
+            not_valid_mask = not_valid.view(N, -1)
 
         return nodes[0].unsqueeze(0).squeeze(-1)
+    
+
+class GATWithEdgeAttrRain(torch.nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels, heads=1):
+        super(GATWithEdgeAttrRain, self).__init__()
+        hidden_channels = 48
+        edge_dim = 17
+        self.hidden_channels = hidden_channels
+        self.fuse_mlp = nn.Linear(3, 1)
+        self.gat = EdgeAttrGNNLayer(hidden_channels, edge_dim=edge_dim, out_channels=hidden_channels)
+
+        # self.rain_mlp = nn.Sequential(
+        #     nn.Linear(1, 8),
+        #     nn.GELU(),
+        #     minGRU(dim=8),
+        #     nn.GELU(),
+        #     nn.Linear(8, 1),
+        # )
+
+        # self.res_mlp = nn.Sequential(
+        #     nn.Linear(1, 8),
+        #     nn.GELU(),
+        #     minGRU(dim=8),
+        #     nn.GELU(),
+        #     nn.Linear(8, 1),
+        # )
+
+        self.rain_mlp = nn.Sequential(
+            nn.Linear(1, 8),
+            nn.GELU(),
+            nn.Linear(8, 8),
+            nn.GELU(),
+            nn.Linear(8, 1),
+        )
+
+        self.res_mlp = nn.Sequential(
+            nn.Linear(1, 8),
+            nn.GELU(),
+            nn.Linear(8, 8),
+            nn.GELU(),
+            nn.Linear(8, 1),
+        )
+
+    def forward(self, nodes, edge_index, edge_attr, valid, r, fx, loc):
+        with torch.no_grad():
+            valid = valid.squeeze(0).unsqueeze(-1)
+            not_valid = 1 - valid
+            nodes = nodes * valid
+
+            N, L, C = nodes.shape
+            nodes = nodes.view(N, -1)  
+
+        # pos_encode = self.pos_encoder(fx).squeeze(0).unsqueeze(1)
+        # pos_encode = pos_encode.repeat(1, L, 1)
+        # rf = self.rain_mlp_1(r.squeeze(0).unsqueeze(-1)).squeeze(-1)
+        # rf = torch.cat([rf, pos_encode], dim=-1)
+        # rf = self.rain_mlp_2(rf).squeeze(-1)
+
+        rf = self.rain_mlp(r.squeeze(0).unsqueeze(-1)).squeeze(-1)
+        residual = nodes[:rf.shape[0]] - rf
+        residual[:, 0] = 0
+        original_residual = residual.clone()
+
+        not_valid = not_valid.repeat(1, 1, C)
+        not_valid_mask = not_valid.view(N, -1)
+        for _ in range(3):
+            new_residual_values = self.gat(residual, edge_index, edge_attr, valid)
+            new_residual = new_residual_values[:, :new_residual_values.shape[-1]//2].view(N, L, C)
+            new_residual = torch.cat([new_residual, residual.view(N, L, C), not_valid], dim=-1)
+            mask = torch.sigmoid(self.fuse_mlp(new_residual).view(N, -1))
+            
+            residual = (1 - mask) * residual + not_valid_mask * mask * new_residual_values[:, :new_residual_values.shape[-1]//2]
+
+            residual = residual + self.res_mlp(residual.unsqueeze(-1)).squeeze(-1)
+            valid = ((original_residual != residual).unsqueeze(-1) | (valid > 0)).float()
+
+        nodes = residual[:rf.shape[0]] + rf  # 
+        return nodes[0].unsqueeze(0).squeeze(-1), rf[:1]

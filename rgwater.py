@@ -20,7 +20,6 @@ from tqdm import tqdm
 
 from model.gnn import GATWithEdgeAttr, GATWithEdgeAttrRain
 from model.mlp import *
-from rgwater import std_loss
 from water_level import has_significant_slope, split_stations_by_clusters
 
 logging.basicConfig(filename="log-test-all-gnn.txt", level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -118,7 +117,7 @@ def location_aware_loss(o, y, loc_list):
 
 
 def create_model(device):
-    model = GATWithEdgeAttr(2, 18, 1, 1).to(device)
+    model = GATWithEdgeAttrRain(2, 18, 1, 1).to(device)
     return model
 
 
@@ -147,7 +146,7 @@ def plot_graph(o, y, x, idx):
     plt.tight_layout()
 
     # Save to file (you can change path/filename as needed)
-    output_path = f'results/{idx}_gnn.png'
+    output_path = f'results/{idx}_rgnn.png'
     plt.savefig(output_path)
     plt.close()
 
@@ -171,6 +170,13 @@ def pearson_corrcoef(x, y, dim=-1, eps=1e-8):
     return corr
 
 
+def std_loss(y_pred, y_true):
+    """
+    Computes the absolute difference between the std of prediction and target.
+    """
+    return torch.abs(torch.std(y_pred) - torch.std(y_true))
+
+
 def test(cfg, train=True):
     if not os.path.exists('data/split.pkl'):
         with open('data/selected_stats_rainfall_segment.pkl', 'rb') as f:
@@ -190,7 +196,8 @@ def test(cfg, train=True):
             good_nb_extended = split['train']
             test_nb = split['test']
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = 'cpu'
 
     # Define your training and testing dataset
     train_dataset = GWaterDataset(path='data/selected_stats_rainfall_segment.pkl', train=True,
@@ -210,13 +217,13 @@ def test(cfg, train=True):
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
     if train:
-        num_epochs = 10
+        num_epochs = 100
         list_loss = []
         epoch_bar = tqdm(range(num_epochs), desc="Epochs")  # tqdm for epochs
 
         for epoch in epoch_bar:
             model.train()
-            for y, x, valid, graph_data, fx, r, _ in tqdm(train_loader, desc=f"Training Epoch {epoch+1}", leave=False):
+            for y, x, valid, graph_data, fx, r, loc in tqdm(train_loader, desc=f"Training Epoch {epoch+1}", leave=False):
                 valid = valid.float().to(device)
                 y = y.to(device).float()
                 x = x.to(device).float()
@@ -225,13 +232,14 @@ def test(cfg, train=True):
                 edge_attr = graph_data.edge_attr.to(device)
                 fx = fx.to(device)
                 r = r.to(device)
+                loc = loc.to(device)
 
                 # Forward pass
-                o = model(nodes, edge_index, edge_attr, valid, r, fx)
+                o, rf = model(nodes, edge_index, edge_attr, valid, r, fx, loc)
 
                 # Compute loss
-                loss = l1_loss(o, y) - pearson_corrcoef(o, y)
-                loss += std_loss(o, y)
+                loss = l1_loss(o, y) + l1_loss(rf, y)# - pearson_corrcoef(o, y) - pearson_corrcoef(rf, y)
+                loss += (std_loss(o, y) + std_loss(rf, y))
 
                 # Backward pass
                 optimizer.zero_grad()
@@ -243,10 +251,10 @@ def test(cfg, train=True):
                 list_loss.append(loss.item())
 
         # Save model periodically
-        torch.save(model.state_dict(), 'model_gnn.pth')
+        torch.save(model.state_dict(), 'model_rgnn.pth')
 
     # Load trained model for evaluation
-    model.load_state_dict(torch.load('model_gnn.pth'))
+    model.load_state_dict(torch.load('model_rgnn.pth'))
     model.eval()
     model.to(device)
 
@@ -265,11 +273,13 @@ def test(cfg, train=True):
             'loss': [],
             'gain': [],
             'tgts': [],
-            'outs': []
+            'outs': [],
         } for k in range(len(list(test_dataset.data.keys())))
     }
 
     seg_len = 168
+    total_elapsed = 0
+    total_n = 0
     with torch.no_grad():
         for idx, (my, mx, mvalid, graph_data, mfx, mr, loc) in enumerate(test_loader):
             mnodes = graph_data.x.unsqueeze(-1)
@@ -277,13 +287,14 @@ def test(cfg, train=True):
             edge_attr = graph_data.edge_attr.to(device)
             mfx = mfx.to(device)
             mr = mr.to(device)
-            start = time.time()
+            loc = loc.to(device)
             
             outs = []
             tgts = []
             cors = []
             gain = []
             for i in range(mx.shape[2] // seg_len):
+                start = time.time()
                 x = mx[:, :, i*seg_len:(i+1)*seg_len].to(device)
                 valid = mvalid[:, :, i*seg_len:(i+1)*seg_len].to(device)
                 y = my[:, i*seg_len:(i+1)*seg_len].to(device)
@@ -299,7 +310,11 @@ def test(cfg, train=True):
                     continue
 
                 # Forward pass
-                o = model(nodes, edge_index, edge_attr, valid, r, fx)
+                o, _ = model(nodes, edge_index, edge_attr, valid, r, fx, loc)
+                elapsed = time.time() - start
+                total_elapsed += elapsed
+                total_n += 1
+                
                 # from calflops import calculate_flops
                 # inputs = {}
                 # inputs["nodes"] = nodes
@@ -336,8 +351,8 @@ def test(cfg, train=True):
                     (y_np - o_np).tolist()
                 )
 
-                # if torch.abs(y).max() > 0.5 and torch.abs(y).max() < 1.0:
-                #     plot_graph(o, y, x[:, :3], f'{loc.numpy()}-{idx}-{i}')
+                if torch.abs(y).max() > 0.5 and torch.abs(y).max() < 1.0:
+                    plot_graph(o, y, x, f'{loc.detach().cpu().numpy()}-{idx}-{i}')
 
             outs = np.array(outs)
             tgts = np.array(tgts)
@@ -347,14 +362,12 @@ def test(cfg, train=True):
                     outs,
                     tgts
                 )
-
                 results[idx]['corr'].append(cor)
                 results[idx]['loss'].append(se)
                 results[idx]['gain'].append(gain)
                 results[idx]['tgts'].append(tgts)
                 results[idx]['outs'].append(outs)
-
-            # print(f'Elapsed: {time.time() - start}')
+    print(f'Total Elapsed: {total_elapsed:.6f} seconds, Average time per segment: {total_elapsed / total_n:.6f} seconds')
 
     rn = cfg.model['target']
     with open(f'g-{rn}-results.pkl', 'wb') as f:
@@ -369,14 +382,14 @@ def main():
     random.seed(42)  # For reproducibility
 
     parser = argparse.ArgumentParser(description="Run the test function with configurable parameters.")
-    parser.add_argument("--cfg", type=str, help="Config file path", default="config/gnn.yaml")
+    parser.add_argument("--cfg", type=str, help="Config file path", default="config/rgnn.yaml")
     parser.add_argument("--training", action="store_true", help="Enable training mode (default: False)")
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.cfg)
 
     with open("log-test-all.txt", "w") as f:
-        test(cfg, train=True)
+        # test(cfg, train=True)
         test(cfg, train=False)
 
 
