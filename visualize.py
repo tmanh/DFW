@@ -168,15 +168,14 @@ def compare_methods_by_bin(results_dict, save_dir='./plots'):
 
 def load_and_log():
     results_dict = {
-        "IDW": 'model.distance.InverseDistance-results.pkl',
-        "OK": 'model.kriging.OrdinaryKrigingInterpolation-results.pkl',
-        "MLP": 'model.mlp.MLPW-results.pkl',
-        "POK": 'model.nngp.SpatioTemporalNNGP.pkl-results.pkl',
-        "PGNN": 'g-model.gnn.GATWithEdgeAttrRain-results-all.pkl',
-        # "no-std": 'g-model.gnn.GATWithEdgeAttrRain-results-no-std.pkl',
-        # "no-cor": 'g-model.gnn.GATWithEdgeAttrRain-results-no-cor.pkl',
-        # "mse-only": 'g-model.gnn.GATWithEdgeAttrRain-results-mse-only.pkl',
-        
+        "IDW": 'backup/model.distance.InverseDistance-results.pkl',
+        "OK": 'backup/model.kriging.OrdinaryKrigingInterpolation-results.pkl',
+        "MLP": 'backup/model.mlp.MLPW-results.pkl',
+        "POK": 'backup/model.nngp.SpatioTemporalNNGP.pkl-results.pkl',
+        "PGNN": 'backup/g-model.gnn.GATWithEdgeAttrRain-results-all.pkl',
+        # "no-std": 'backup/g-model.gnn.GATWithEdgeAttrRain-results-no-std.pkl',
+        # "no-cor": 'backup/g-model.gnn.GATWithEdgeAttrRain-results-no-cor.pkl',
+        # "mse-only": 'backup/g-model.gnn.GATWithEdgeAttrRain-results-mse-only.pkl',
     }
     for k in list(results_dict.keys()):
         with open(results_dict[k], 'rb') as f:
@@ -233,13 +232,3 @@ def drawing(results_dict, chunk_len=168):
 folder = './'
 
 load_and_log()
-# load_and_log(os.path.join(folder, 'model.mlp.MLP-results.pkl'), 'mlp')
-
-# load_and_log(os.path.join(folder, 'model.kriging.OrdinaryKrigingInterpolation-results.pkl'), 'ok')
-# load_and_log(os.path.join(folder, 'model.mlp.MLPW-results.pkl'), 'mlpw')
-# # load_and_log(os.path.join(folder, 'model.mlp.MLPRW-results.pkl'), 'mlprw')
-# # load_and_log(os.path.join(folder, 'model.mlp.MLPR-results.pkl'), 'mlpr')
-# load_and_log(os.path.join(folder, 'g-model.gnn.GATWithEdgeAttr-results.pkl'), 'gnn')
-# load_and_log(os.path.join(folder, 'model.distance.InverseDistance-results.pkl'), 'idw')
-# # load_and_log(os.path.join(folder, 'model.kriging.UniversalKrigingInterpolation-results.pkl'), 'uk')
-# load_and_log(os.path.join(folder, 'model.nngp.SpatioTemporalNNGP.pkl-results.pkl'), 'nngp')
