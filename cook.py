@@ -4,16 +4,13 @@ import argparse
 import time
 
 import torch
-import torch.nn as nn
-import torch.optim as optim
 
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.signal import medfilt
 
-from sklearn.gaussian_process.kernels import RBF, Matern
+from sklearn.gaussian_process.kernels import RBF
 
-from common.utils import instantiate_from_config
 from model.mlp import *
 from sklearn.cluster import KMeans
 
@@ -24,7 +21,7 @@ from omegaconf import OmegaConf
 from tqdm import tqdm
 from torchmetrics.functional import pearson_corrcoef
 
-from model.nngp import SpatioTemporalNNGP
+from model.cokriging import OrdinaryCokriging
 
 
 logging.basicConfig(filename="log-test-all.txt", level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -34,7 +31,7 @@ def plot_graph(o, y, x, idx):
     # Move tensors to CPU and convert to NumPy
     o_np = o
     y_np = y
-    x_np = x
+    # x_np = x
 
     # Create a time axis
     time_steps = range(len(y_np))
@@ -42,8 +39,8 @@ def plot_graph(o, y, x, idx):
     # Create and save plot
     plt.figure(figsize=(12, 6))
     plt.plot(time_steps, y_np, label='Ground Truth (y)', marker='o')
-    for i in range(x_np.shape[1]):
-        plt.plot(time_steps, x_np[:, i], label=f'Source ({i})', marker='o')
+    # for i in range(x_np.shape[1]):
+    #     plt.plot(time_steps, x_np[:, i], label=f'Source ({i})', marker='o')
     plt.plot(time_steps, o_np, label='Interpolated (o)', marker='x')
     plt.title('Comparison of Ground Truth and Interpolated Time Series')
     plt.xlabel('Time Step')
@@ -53,7 +50,7 @@ def plot_graph(o, y, x, idx):
     plt.tight_layout()
 
     # Save to file (you can change path/filename as needed)
-    output_path = f'results/{idx}_nngp.png'
+    output_path = f'results/{idx}_ked.png'
     plt.savefig(output_path)
     plt.close()
 
@@ -228,47 +225,7 @@ def test(cfg, train=True):
             good_nb_extended = split['train']
             test_nb = split['test']
 
-    train_dataset = WaterDatasetX(
-        path='data/selected_stats_rainfall_segment.pkl', train=True,
-        selected_stations=good_nb_extended
-    )
-    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
-
-    # Define spatial kernel (e.g., Matern)
-    # kernel = RBF(length_scale=1.0, length_scale_bounds=(1e-6, 1e3))
-    kernel = RBF(length_scale=1.0, length_scale_bounds=(1e-2, 1e3))
-    model = SpatioTemporalNNGP(
-        kernel=kernel,
-        alpha=1e-6,  # jitter for numerical stability
-        phi=0.8,     # autoregressive temporal parameter (typically between -1 and 1)
-        tau2=0.1     # observation noise variance
-    )
-
-    # Training loop
-    ckpt_name = 'model.nngp.SpatioTemporalNNGP.pkl'
-
-    if not os.path.exists(ckpt_name):
-        all_xs = []
-        all_y = []
-        for xs, y, lrain in tqdm(train_loader, desc=f"Training", leave=False):
-            y = y.squeeze(0).detach().cpu().numpy()
-            xs = xs.repeat(lrain.shape[1], 1).detach().cpu().numpy()
-            lrain = lrain.squeeze(0).unsqueeze(-1).detach().cpu().numpy()
-
-            all_xs.append(np.concatenate([xs, lrain], axis=-1))
-            all_y.append(y)
-
-        X_flat = np.concatenate(all_xs, axis=0)
-        y_flat = np.concatenate(all_y, axis=0)
-        model.fit(X_flat, y_flat.reshape(-1, 1))
-
-        with open(ckpt_name, 'wb') as f:
-            pickle.dump(model, f)
-    else:
-        with open(ckpt_name, 'rb') as f:
-            model = pickle.load(f)
-    
-    test_dataset = WaterDatasetY(
+    test_dataset = WaterDatasetYAllStations(
         path='data/selected_stats_rainfall_segment.pkl', train=False,
         selected_stations=test_nb, input_type=cfg.dataset.inputs
     )
@@ -283,9 +240,14 @@ def test(cfg, train=True):
         } for k in range(len(list(test_dataset.data.keys())))
     }
 
-    # for idx, (mxs, my, mlrain, mnbxs, mnby, mnrain) in enumerate(test_loader):
-    #     pass
-    # exit()
+    # Define variogram models
+    variogram_models = {
+        'var0': ('exponential', {'sill': 80.0, 'range': 35.0, 'nugget': 4.0}),
+        'var1': ('exponential', {'sill': 60.0, 'range': 30.0, 'nugget': 3.0}),
+        'cross_01': ('exponential', {'sill': 50.0, 'range': 32.0, 'nugget': 2.0})
+    }
+
+    model = OrdinaryCokriging(variogram_models=variogram_models, n_variables=2)
 
     seg_len = 168
     total_elapsed = 0
@@ -304,21 +266,20 @@ def test(cfg, train=True):
                 xs = mxs.detach().cpu().numpy()
                 lrain = mlrain[:, i*seg_len:(i+1)*seg_len].detach().cpu().numpy()
                 nrain = mnrain[:, :, i*seg_len:(i+1)*seg_len].detach().cpu().numpy()
-                
-                y = np.expand_dims(y[0], axis=-1)
-                xs = xs.repeat(y.shape[0], axis=0)
-                lrain = np.expand_dims(lrain[0], axis=-1)
-                all_xs = np.concatenate([xs, lrain], axis=-1)
 
-                if not has_significant_slope(y[:, 0]):
+                if not has_significant_slope(np.expand_dims(y[0], axis=-1)[:, 0]):
                     continue
 
-                nby = np.expand_dims(nby[0], axis=-1).transpose(1, 0, 2)
-                nxs = nxs.repeat(y.shape[0], axis=0)
-                nrain = np.expand_dims(nrain[0], -1).transpose(1, 0, 2)
-                all_nxs = np.concatenate([nxs, nrain], axis=-1)
+                o = np.zeros((1, y.shape[1]))
+                for tidx in range(y.shape[1]):
+                    model.fit(
+                        X_list=[nxs[0], nxs[0]],                    # station coordinates
+                        y_list=[nby[0, :, tidx], nrain[0, :, tidx]] # water level and precipitation
+                    )
 
-                o = model.predict(all_nxs, nby, all_xs)[:, 0]
+                    o[0, tidx] = model.predict(
+                        X_pred=[xs[0]],  # target station coordinate
+                    )[0]
 
                 total_elapsed += time.time() - start_time
                 total_n += 1
@@ -347,6 +308,8 @@ def test(cfg, train=True):
                 o = o.flatten()
                 y = y.flatten()
 
+                o = suppress_spike_segments(o)
+
                 outs.extend(
                     o
                 )
@@ -362,9 +325,7 @@ def test(cfg, train=True):
                 gain.extend(
                     (y - o).tolist()
                 )
-
-                if np.abs(y).max() > 0.5 and np.abs(y).max() < 1.0:
-                    plot_graph(o, y, nby, f'{loc.numpy()}-{idx}-{i}')
+                plot_graph(o, y, nby, f'{loc.numpy()}-{idx}-{i}')
 
             outs = np.array(outs)
             tgts = np.array(tgts)
@@ -382,8 +343,73 @@ def test(cfg, train=True):
 
     print(f'Total Elapsed: {total_elapsed:.6f} seconds, Average time per segment: {total_elapsed / total_n:.6f} seconds')
 
+    ckpt_name = 'model.nngp.CoKriging.pkl'
     with open(f'{ckpt_name}-results.pkl', 'wb') as f:
         pickle.dump(results, f)
+
+
+def suppress_spike_segments(
+    signal,
+    z_thresh=6.0,
+    max_segment_len=8,
+    context=5
+):
+    """
+    Suppress short contiguous spike segments using local median.
+
+    Parameters
+    ----------
+    signal : 1D np.ndarray
+    z_thresh : float
+        MAD-based outlier threshold
+    max_segment_len : int
+        Maximum length of spike segment to correct
+    context : int
+        Number of neighbors on each side for median replacement
+
+    Returns
+    -------
+    filtered : np.ndarray
+    """
+    x = signal.copy()
+    n = len(x)
+
+    # Robust stats
+    med = np.median(x)
+    mad = np.median(np.abs(x - med)) + 1e-8
+    z = np.abs(x - med) / mad
+
+    is_outlier = z > z_thresh
+
+    i = 0
+    while i < n:
+        if not is_outlier[i]:
+            i += 1
+            continue
+
+        # Find contiguous segment
+        start = i
+        while i < n and is_outlier[i]:
+            i += 1
+        end = i  # [start, end)
+
+        seg_len = end - start
+
+        # Only fix *short* pathological bursts
+        if seg_len <= max_segment_len:
+            left = max(0, start - context)
+            right = min(n, end + context)
+
+            neighborhood = np.concatenate([
+                x[left:start],
+                x[end:right]
+            ])
+
+            if len(neighborhood) > 0:
+                replacement = np.median(neighborhood)
+                x[start:end] = replacement
+
+    return x
 
 
 def main():
@@ -398,10 +424,6 @@ def main():
 
     cfg = OmegaConf.load(args.cfg)
 
-    if args.training:
-        print('-----Training-----')
-        test(cfg, train=True)
-        
     print('-----Testing-----')
     test(cfg, train=False)
 

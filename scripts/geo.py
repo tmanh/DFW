@@ -12,6 +12,18 @@ from shapely.strtree import STRtree  # Faster spatial index for points
 from scipy import spatial
 
 
+def save_pkl(graph, path):
+    """Save a NetworkX graph to a pickle file."""
+    with open(path, "wb") as f:
+        pickle.dump(graph, f)
+
+
+def load_pkl(path):
+    """Load a NetworkX graph from a pickle file."""
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
 def check_connection_and_distance(G, node1, node2):
     print('Node1:', (node1[1], node1[0]), ' --- ' , 'Node2:', (node2[1], node2[0]))
 
@@ -256,172 +268,197 @@ def create_simplified_graphs(data):
 
 
 def main():
-    waterways, DiG, node_ids, tree, UndiG, node2_ids, tree2 = create_waterway_graph()
+    # --- Load waterway graphs and node spatial indexes
+    # Load graphs and spatial indexes
+    (
+        waterways, directed_graph, directed_node_ids, directed_tree,
+        undirected_graph, undirected_node_ids, undirected_tree,
+    ) = create_waterway_graph()
 
-    with open('data/selected_stats_rainfall_segment.pkl', 'rb') as f:
-        data = pickle.load(f)
+    # --- Load station data
+    data = load_pkl('data/selected_stats_rainfall_segment.pkl')
 
-    # with open('data/neighbor.pkl', 'rb') as f:
-    #     neighbors = pickle.load(f)
+    neighbors_dict = get_neighbors_dict(data, n_neighbors=10)
 
-    coords = np.array(list(data.keys()))  # shape (N, 2)
-    keys = list(data.keys())
+    # Build graph connections for each station
+    build_station_waterway_connections(
+        data, neighbors_dict,
+        undirected_tree, undirected_node_ids, undirected_graph, directed_graph
+    )
 
-    # Compute pairwise L2 distances
-    dists = np.linalg.norm(coords[:, None, :] - coords[None, :, :], axis=-1)  # shape (N, N)
+    # Save updated data
+    save_pkl(data, 'data/selected_stats_rainfall_segment.pkl')
 
-    # For each location, get indices of 10 closest (excluding self)
-    neighbors_dict = {}
-    for i in range(len(keys)):
-        nearest = np.argsort(dists[i])[1:21]  # skip self at index 0
-        dists[i].sort()
-        neighbors_dict[keys[i]] = [keys[j] for j in nearest]
-
-    if True: #'graph' not in data[list(data.keys())[0]].keys():
-        for k in data.keys():
-            print(f'<>----{k}----<>')
-            qry2_node, _, _ = find_nearest_edge(tree2, node2_ids, k, UndiG)
-
-            data[k]['graph'] = {}
-            for nb in neighbors_dict[k]:
-                if nb not in data.keys():
-                    continue
-
-                data[k]['graph'][nb] = {}
-
-                # print('>-------<')
-                ref2_node, _, _ = find_nearest_edge(tree2, node2_ids, nb, UndiG)
-
-                _, _, _, path = check_connection_and_distance(UndiG, qry2_node, ref2_node)
-
-                if path is not None:
-                    # Extract directed edges from G2 that exist along the path
-                    path = [(p[1], p[0]) for p in path]
-                    directed_edges = [
-                        (
-                            path[i], path[i+1]
-                        ) if DiG.has_edge(path[i], path[i+1]) else (
-                            path[i+1], path[i]
-                        )
-                        for i in range(len(path) - 1)
-                    ]
-
-                    data[k]['graph'][nb]['edges'] = directed_edges
-                    data[k]['graph'][nb]['nodes'] = path
-                else:
-                    data[k]['graph'][nb]['edges'] = None
-                    data[k]['graph'][nb]['nodes'] = None
-
-        with open(f'data/selected_stats_rainfall_segment.pkl', 'wb') as f:
-            pickle.dump(data, f)
-
-    # dict_keys(
-    # ['neighbor', 'series', 'time', 'fclass',
-    # 'width', 'neighbor_stats', 'common_time',
-    # 'common_time_idx', 'nb_common_time_idx',
-    # 'adj_series', 'top_25_series', 'top_25_time',
-    # 'neighbor_path', 'avg', 'mean_w', 'max_zw', 'std_w']
-    # )
+    # Build simplified graphs and print summary
     data, simplified_graphs = create_simplified_graphs(data)
-    for station, graph in simplified_graphs.items():
-        print("Station:", station)
+    print_simplified_graphs(simplified_graphs)
+
+    # --- Save the final data again (if needed)
+    save_pkl(data, 'data/selected_stats_rainfall_segment.pkl')
+
+
+def build_node_kdtree(graph):
+    """Build a KDTree for fast spatial queries of graph nodes."""
+    nodes_array = np.array(list(graph.nodes))
+    kdtree = spatial.KDTree(nodes_array)
+    return nodes_array, kdtree
+
+
+def find_intersection_points(all_lines, waterways):
+    """Find all unique intersection points among the provided LineStrings."""
+    sindex = waterways.sindex
+    intersection_point_coords = set()
+
+    for idx, line in enumerate(all_lines):
+        candidate_indices = list(sindex.intersection(line.bounds))
+        candidates = [all_lines[i] for i in candidate_indices if i > idx]
+        for other_line in candidates:
+            if line.intersects(other_line):
+                intersection = line.intersection(other_line)
+                if intersection.geom_type == "Point":
+                    intersection_point_coords.add((intersection.x, intersection.y))
+                elif intersection.geom_type == "MultiPoint":
+                    for pt in intersection.geoms:
+                        intersection_point_coords.add((pt.x, pt.y))
+    return [Point(x, y) for x, y in intersection_point_coords]
+
+
+def split_lines_at_points(all_lines, intersection_points):
+    """Split all lines at the given intersection points."""
+    intersection_index = STRtree(intersection_points)
+    split_lines = []
+    for line in all_lines:
+        relevant_points = intersection_index.query(line)
+        split_candidates = [pt for pt in relevant_points if isinstance(pt, Point)]
+        if split_candidates:
+            split_result = split(line, MultiPoint(split_candidates))
+            split_lines.extend(split_result.geoms)
+        else:
+            split_lines.append(line)
+    return split_lines
+
+
+def build_graphs_from_lines(split_lines, intersection_points):
+    """Build directed and undirected graphs from split LineStrings and add intersection points as nodes."""
+    directed_graph = nx.DiGraph()
+    undirected_graph = nx.Graph()
+    for geom in split_lines:
+        if geom.geom_type == "LineString":
+            lines = [geom]
+        elif geom.geom_type == "MultiLineString":
+            lines = geom.geoms
+        else:
+            continue  # Ignore unsupported geometry types
+
+        for line in lines:
+            coords = list(line.coords)
+            for i in range(len(coords) - 1):
+                point1, point2 = coords[i], coords[i + 1]
+                distance_km = geodesic(point1, point2).km
+                directed_graph.add_edge(point1, point2, weight=distance_km)
+                undirected_graph.add_edge(point1, point2, weight=distance_km)
+
+    for point in intersection_points:
+        directed_graph.add_node((point.x, point.y))
+        undirected_graph.add_node((point.x, point.y))
+
+    return directed_graph, undirected_graph
+
+
+def get_neighbors_dict(data, n_neighbors=20):
+    """Return a dictionary mapping each station to its n nearest neighbors."""
+    station_coords = np.array(list(data.keys()))
+    station_keys = list(data.keys())
+    pairwise_distances = np.linalg.norm(
+        station_coords[:, None, :] - station_coords[None, :, :], axis=-1
+    )
+    neighbors_dict = {}
+    for idx, key in enumerate(station_keys):
+        nearest_indices = np.argsort(pairwise_distances[idx])[1 : n_neighbors + 1]
+        neighbors_dict[key] = [station_keys[j] for j in nearest_indices]
+    return neighbors_dict
+
+
+def build_station_waterway_connections(
+    data, neighbors_dict, undirected_tree, undirected_node_ids, undirected_graph, directed_graph
+):
+    """Populate each station's 'graph' key with waterway connection info to its neighbors."""
+    for station_key in data:
+        print(f'<---- Station: {station_key} ---->')
+        query_node, _, _ = find_nearest_edge(undirected_tree, undirected_node_ids, station_key, undirected_graph)
+
+        data[station_key]['graph'] = {}
+        for neighbor_key in neighbors_dict[station_key]:
+            if neighbor_key not in data:
+                continue
+            data[station_key]['graph'][neighbor_key] = {}
+
+            ref_node, _, _ = find_nearest_edge(undirected_tree, undirected_node_ids, neighbor_key, undirected_graph)
+            _, _, _, path = check_connection_and_distance(undirected_graph, query_node, ref_node)
+
+            if path is not None:
+                # (lat, lon) ordering
+                path_latlon = [(p[1], p[0]) for p in path]
+                directed_edges = [
+                    (path_latlon[i], path_latlon[i + 1])
+                    if directed_graph.has_edge(path_latlon[i], path_latlon[i + 1]) else
+                    (path_latlon[i + 1], path_latlon[i])
+                    for i in range(len(path_latlon) - 1)
+                ]
+                data[station_key]['graph'][neighbor_key]['edges'] = directed_edges
+                data[station_key]['graph'][neighbor_key]['nodes'] = path_latlon
+            else:
+                data[station_key]['graph'][neighbor_key]['edges'] = None
+                data[station_key]['graph'][neighbor_key]['nodes'] = None
+
+
+def print_simplified_graphs(simplified_graphs):
+    """Print summary of nodes and edges for each simplified graph."""
+    for station_key, graph in simplified_graphs.items():
+        print(f"Station: {station_key}")
         print("Nodes:", graph['nodes'])
         print("Edges:")
         for edge in graph['edges']:
             print("  ", edge)
         print()
 
-    with open('data/selected_stats_rainfall_segment.pkl', 'wb') as f:
-        pickle.dump(data, f)
-
 
 def create_waterway_graph():
+    """Load and construct waterway graphs and spatial indexes from shapefile and/or pickles."""
+
     waterways = gpd.read_file("data/Vhag_prj.shp")
 
-    # Create an empty graph
-    G = nx.DiGraph()  # Create a directed graph
-    G2 = nx.Graph()  # Create a directed graph
+    # Initialize graphs: directed (G) and undirected (G2)
+    directed_graph = nx.DiGraph()
+    undirected_graph = nx.Graph()
 
-    if not os.path.exists("data/graph.pickle"):
-        # Step 1: Create a Spatial Index for the LineStrings
-        sindex = waterways.sindex  # Build spatial index for fast lookups
+    graph_pickle_path = "data/graph.pickle"
+    undirected_pickle_path = "data/graph2.pickle"
+
+    if not os.path.exists(graph_pickle_path):
         all_lines = waterways.geometry.tolist()
-        intersection_points = set()  # Use a set to store unique intersection points
+        intersection_points = find_intersection_points(all_lines, waterways)
+        split_lines = split_lines_at_points(all_lines, intersection_points)
+        directed_graph, undirected_graph = build_graphs_from_lines(split_lines, intersection_points)
+        save_pkl(directed_graph, graph_pickle_path)
+        save_pkl(undirected_graph, undirected_pickle_path)
 
-        # Step 2: Efficiently Find Intersections Using Spatial Index
-        for idx, line in enumerate(all_lines):
-            possible_matches_idx = list(sindex.intersection(line.bounds))  # Get bounding box matches
-            possible_matches = [all_lines[i] for i in possible_matches_idx if i > idx]  # Avoid duplicates
-
-            for other_line in possible_matches:
-                if line.intersects(other_line):
-                    intersection = line.intersection(other_line)
-
-                    if intersection.geom_type == "Point":
-                        intersection_points.add((intersection.x, intersection.y))  # Store as tuple
-                    elif intersection.geom_type == "MultiPoint":
-                        for pt in intersection.geoms:
-                            intersection_points.add((pt.x, pt.y))  # Store unique points
-
-        # Convert intersection points to Shapely Point objects and build spatial index
-        intersection_points = [Point(x, y) for x, y in intersection_points]
-        point_index = STRtree(intersection_points)  # Fast lookup for relevant points
-
-        # Step 3: Optimized Splitting of LineStrings
-        new_lines = []
-        for line in all_lines:
-            # Find only nearby intersection points for this line
-            nearby_points = point_index.query(line)  # STRtree query finds relevant points fast
-            
-            # Only split if there are relevant points
-            if len(nearby_points) > 0:
-                split_line = split(line, MultiPoint([intersection_points[p] for p in nearby_points if isinstance(intersection_points[p], Point)]))  # Ensure only Points are included
-                new_lines.extend(split_line.geoms)
-            else:
-                new_lines.append(line)  # Keep original line if no split needed
-
-        # Step 4: Add Nodes & Edges to the Graph
-        for geom in new_lines:
-            if geom.geom_type == "LineString":
-                lines = [geom]
-            elif geom.geom_type == "MultiLineString":
-                lines = geom.geoms
-            else:
-                continue  # skip unknown geometry types
-
-            for line in lines:
-                coords = list(line.coords)
-                for i in range(len(coords) - 1):
-                    point1, point2 = coords[i], coords[i + 1]
-                    G.add_edge(point1, point2, weight=geodesic(point1, point2).km)
-                    G2.add_edge(point1, point2, weight=geodesic(point1, point2).km)
-
-        # Step 5: Ensure All Intersection Points Are Nodes
-        for point in intersection_points:
-            G.add_node((point.x, point.y))  # Ensure intersection nodes exist in the graph
-            G2.add_node((point.x, point.y))  # Ensure intersection nodes exist in the graph
-
-        with open("data/graph.pickle", "wb") as f:
-            pickle.dump(G, f)
-        
-        with open("data/graph2.pickle", "wb") as f:
-            pickle.dump(G2, f)
     else:
-        with open("data/graph.pickle", "rb") as f:
-            G = pickle.load(f)
+        # --- Load precomputed graphs from disk
+        directed_graph = load_pkl(graph_pickle_path)
+        undirected_graph = load_pkl(undirected_pickle_path)
 
-        with open("data/graph2.pickle", "rb") as f:
-            G2 = pickle.load(f)
-    
-    nodes = np.array(G.nodes)
-    node_ids = list(G.nodes)
-    tree = spatial.KDTree(nodes)
+    # --- Build spatial KDTree indexes for nodes
+    _, directed_kdtree = build_node_kdtree(directed_graph)
+    _, undirected_kdtree = build_node_kdtree(undirected_graph)
 
-    nodes2 = np.array(G2.nodes)
-    node2_ids = list(G2.nodes)
-    tree2 = spatial.KDTree(nodes2)
-    
-    return waterways, G, node_ids, tree, G2, node2_ids, tree2
+    # --- Return all relevant data structures
+    return (
+        waterways,
+        directed_graph, list(directed_graph.nodes), directed_kdtree,
+        undirected_graph, list(undirected_graph.nodes), undirected_kdtree,
+    )
+
 
 
 if __name__ == "__main__":

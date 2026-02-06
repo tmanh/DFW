@@ -1,8 +1,7 @@
 model:
-  target: model.mlp.MLPW
+  target: model.p2w.CGRU_Diffusion
   params:
-    in_dim: 12
-    n_layers: 2
+    in_dim: 1
     n_dim: 8
 
 dataset:

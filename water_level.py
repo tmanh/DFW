@@ -378,7 +378,10 @@ def test(cfg, train=True):
                 results[idx]['gain'].append(gain)
                 results[idx]['tgts'].append(tgts)
                 results[idx]['outs'].append(outs)
+                results[idx]['loc'] = loc.detach().cpu().numpy()
 
+    for k in results.keys():
+        print(f"Key: {k} - {results[k]['loc'] if 'loc' in results[k] else 'No Location'}, Output: {results[k]['outs'][0].shape if len(results[k]['outs']) > 0 else 0}")
     print(f'Total Elapsed: {total_elapsed:.6f} seconds, Average time per segment: {total_elapsed / total_n:.6f} seconds')
 
     with open(f'{rn}-results.pkl', 'wb') as f:

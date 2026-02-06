@@ -52,9 +52,15 @@ class SpatioTemporalNNGP:
             # Spatial prediction only
             # pred, std = self.nngp_spatial_model.predict(X_pred[t][:, :2], return_std=True)
             ok = OrdinaryKriging(
-                X_0[t][:, 0:1], X_0[t][:, 1:2], y_0[t],
-                variogram_model='linear',
+                X_0[t][:, 0],
+                X_0[t][:, 1],
+                y_0[t],
+                variogram_model="linear",
+                variogram_parameters={"slope": 1.0, "nugget": 0.0},
+                enable_plotting=False,
+                verbose=False,
             )
+
             pred, _ = ok.execute('points', [X_pred[t][:, 0:1]], [X_pred[t][:, 1:2]])
             predictions[t] = mean_structure + pred[0]
             # std_devs[t] = np.sqrt(std**2 + self.tau2)

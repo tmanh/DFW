@@ -47,7 +47,7 @@ class MLPW(MLP):
         super().__init__(in_dim, n_layers, n_dim)
 
     def forward(self, xs, x, lrain, nrain, valid):
-        feats = self.dist(1 / (xs[:, :, :18] + 1e-6))
+        feats = self.dist(1 / (xs[:, :, :-4] + 1e-6))
         weights = self.weight(feats)
         weights = torch.sigmoid(weights)
         alpha = weights / (torch.sum(weights, dim=1, keepdim=True) + 1e-8)
@@ -146,10 +146,10 @@ class MLPRW(nn.Module):
         self.weight = nn.Linear(in_features=n_dim + n_dim, out_features=1)
 
     def forward(self, xs, x, lrain, nrain, valid):
-        tgt_pos = xs[:, :, 18:20]
-        src_pos = xs[:, :, 20:]
-        rel = xs[:, :, :18]
-
+        tgt_pos = xs[:, :, -4:-2]
+        src_pos = xs[:, :, -2:]
+        rel = xs[:, :, :-4]
+        
         mod = self.dist_loc_2(torch.cat([
             self.dist_loc(tgt_pos), self.dist_loc(src_pos)
         ], dim=-1))

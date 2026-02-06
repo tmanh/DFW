@@ -25,72 +25,6 @@ class fullGRU(nn.Module):
         return out
 
 
-def time_varying_conv1d(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """
-    Causal time-varying FIR.
-    x: [B, T, C]  (signal)
-    w: [B, T, K]  (kernel at each time step; shared across channels)
-    returns y: [B, T, C]  (same length)
-    """
-    B, T, C = x.shape
-    Bw, Tw, K = w.shape
-    assert B == Bw and T == Tw, "Batch/time dims must match"
-
-    # causal same-length: pad K-1 on the left so each t uses x[t-K+1 ... t]
-    x_pad = F.pad(x.permute(0, 2, 1), (K-1, 0))      # [B, C, T+K-1]
-    # make sliding windows of length K along time
-    x_win = x_pad.unfold(dimension=-1, size=K, step=1)  # [B, C, T, K]
-
-    # w is [B, T, K] -> broadcast over channels: [B, 1, T, K]
-    w_exp = w.unsqueeze(1)                               # [B, 1, T, K]
-
-    # dot product over the K dimension -> [B, C, T]
-    y = (x_win * w_exp).sum(dim=-1)                      # [B, C, T]
-    return y.permute(0, 2, 1)                            # [B, T, C]
-
-
-class HyperFIR(nn.Module):
-    """
-    Generate a per-sample FIR kernel from static features z,
-    then convolve with x_main.
-    """
-    def __init__(self):
-        super().__init__()
-
-        self.k_len = 9
-        self.pos_enc = minGRU(8, expansion_factor=2)
-        self.mlp = nn.Sequential(
-            nn.Linear(10, 8),
-            nn.GELU(),
-            nn.Linear(8, 8),
-        )
-
-        self.kernel = nn.Sequential(
-            minGRU(8, expansion_factor=2),
-            nn.GELU(),
-            nn.Linear(8, self.k_len),
-        )
-
-    def forward(self, x_main: torch.Tensor, zi: torch.Tensor, zj: torch.Tensor):
-        """
-        x_main: [B,8,T], z: [B,S]
-        returns: y_lin [B,1,T]
-        """
-        x_main = x_main.view(x_main.shape[0], -1, 8)  # [B,1,T]
-
-        feats = self.mlp(torch.cat([zi[:, -5:], zj[:, -5:]], dim=-1))                   # [B,8]
-        pos = self.pos_enc(x_main)                    # [B, K]
-
-        feats = feats.unsqueeze(1) + pos                           # [B, K]
-
-        w = self.kernel(feats)           # [B, 1, K]
-        w = F.normalize(w, dim=-1)
-        # w = w / (w.abs().sum(dim=-1, keepdim=True) + 1e-6)
-
-        y = time_varying_conv1d(x_main, w)
-        return y
-
-
 class EdgeAttrGNNLayer(MessagePassing):
     def __init__(self, in_channels, edge_dim, out_channels=8):
         super().__init__(aggr='add')  # or 'mean', 'max'
@@ -230,27 +164,6 @@ class GATWithEdgeAttr(torch.nn.Module):
         pred = self.gat(nodes.unsqueeze(-1), edge_index, edge_attr, valid)
 
         return pred[:1]
-
-
-class GATWithEdgeAttr(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels, heads=1):
-        super(GATWithEdgeAttr, self).__init__()
-        hidden_channels = 48
-        edge_dim = 16
-        self.hidden_channels = hidden_channels
-        self.gat = EdgeAttrGNNLayer(hidden_channels, edge_dim=edge_dim, out_channels=-1)
-
-    def forward(self, nodes, edge_index, edge_attr, valid, r, fx):
-        with torch.no_grad():
-            valid = valid.squeeze(0).unsqueeze(-1)
-            nodes = nodes * valid
-
-            N, L, C = nodes.shape
-            nodes = nodes.view(N, -1)
-
-        pred = self.gat(nodes.unsqueeze(-1), edge_index, edge_attr, valid)
-
-        return pred[:1]
     
 
 class RainModel(torch.nn.Module):
@@ -262,16 +175,6 @@ class RainModel(torch.nn.Module):
             nn.GELU(),
             nn.Linear(8, 8),
         )
-        # self.rain_mlp = nn.Sequential(
-        #     nn.Linear(1, 8),
-        #     nn.GELU(),
-        #     minGRU(8),
-        # )
-        # self.rain_mlp = nn.Sequential(
-        #     nn.Linear(1, 8),
-        #     nn.GELU(),
-        #     nn.GRU(8, 8, batch_first=True)
-        # )
 
         self.rain_pos_enc = nn.Sequential(
             nn.Linear(2, 8),
@@ -283,9 +186,6 @@ class RainModel(torch.nn.Module):
         # r: [N, L, 1]
         # pos: [N, L, 2]
         r = self.rain_mlp(r.squeeze(0).unsqueeze(-1)).squeeze(-1)
-        # r = self.rain_mlp(r.squeeze(0).unsqueeze(-1))[0].contiguous()
-        # pos_enc = self.rain_pos_enc(pos[:, :, -2:].squeeze(0)).unsqueeze(1).squeeze(-1)
-        # r = r * pos_enc
         return r
     
 
@@ -323,7 +223,7 @@ class MLPW(nn.Module):
         weights = torch.relu(weights)
         alpha = weights / (torch.sum(weights, dim=0, keepdim=True) + 1e-8)
         return torch.sum(x * alpha, dim=0, keepdim=True)
-    
+
 
 def forward_distance(xs, x):
     """
@@ -398,7 +298,7 @@ class GATWithEdgeAttrRain(torch.nn.Module):
             adjusted_nodes, pred[:res_idx],
             pred_coarse[:res_idx], original_valid
         )
-
+    
     def find_n_neighbors(self, r, rf):
         res_idx = rf.shape[0]
         for i in range(rf.shape[0]):
@@ -406,7 +306,7 @@ class GATWithEdgeAttrRain(torch.nn.Module):
                 res_idx = i
                 break
         return res_idx
-
+    
 
 def distance(coord1: torch.Tensor,
              coord2: torch.Tensor

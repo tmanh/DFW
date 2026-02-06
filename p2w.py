@@ -9,9 +9,6 @@ import torch.optim as optim
 
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.signal import medfilt
-
-from sklearn.gaussian_process.kernels import RBF, Matern
 
 from common.utils import instantiate_from_config
 from model.mlp import *
@@ -23,8 +20,9 @@ from torch.utils.data import DataLoader
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from torchmetrics.functional import pearson_corrcoef
+from scipy.signal import medfilt
 
-from model.nngp import SpatioTemporalNNGP
+from rgwater import std_loss
 
 
 logging.basicConfig(filename="log-test-all.txt", level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -32,9 +30,11 @@ logging.basicConfig(filename="log-test-all.txt", level=logging.INFO, format="%(a
 
 def plot_graph(o, y, x, idx):
     # Move tensors to CPU and convert to NumPy
-    o_np = o
-    y_np = y
-    x_np = x
+    o_np = o.detach().cpu().numpy().flatten()
+    y_np = y.detach().cpu().numpy().flatten()
+    if len(x.shape) == 3:
+        x = x.squeeze(0)
+    x_np = x.detach().cpu().numpy()
 
     # Create a time axis
     time_steps = range(len(y_np))
@@ -42,8 +42,8 @@ def plot_graph(o, y, x, idx):
     # Create and save plot
     plt.figure(figsize=(12, 6))
     plt.plot(time_steps, y_np, label='Ground Truth (y)', marker='o')
-    for i in range(x_np.shape[1]):
-        plt.plot(time_steps, x_np[:, i], label=f'Source ({i})', marker='o')
+    for i in range(x_np.shape[0]):
+        plt.plot(time_steps, x_np[i], label=f'Source ({i})', marker='o')
     plt.plot(time_steps, o_np, label='Interpolated (o)', marker='x')
     plt.title('Comparison of Ground Truth and Interpolated Time Series')
     plt.xlabel('Time Step')
@@ -53,7 +53,7 @@ def plot_graph(o, y, x, idx):
     plt.tight_layout()
 
     # Save to file (you can change path/filename as needed)
-    output_path = f'results/{idx}_nngp.png'
+    output_path = f'results/{idx}.png'
     plt.savefig(output_path)
     plt.close()
 
@@ -62,25 +62,11 @@ def plot_graph(o, y, x, idx):
 
 
 def get_checkpoint_name(cfg):
-    rn = str(cfg.model['target'])
-    if rn == 'model.gru.GRU':
-        mn = 'gru'
-    elif rn == 'model.mlp.MLP':
-        mn = 'mlp'
-    elif rn == 'model.gnn.GNN':
-        mn = 'gnn'
-    elif rn == 'model.mlp.MLPW':
-        mn = 'mlpw'
-    elif rn == 'model.mlp.MLPRW':
-        mn = 'mlprw'
-    elif rn == 'model.mlp.MLPR':
-        mn = 'mlpr'
-    else:
-        return None
-    return f'model_{mn}.pth'
+    rn = str(cfg.model['target']).split('.')[-1].lower()
+    return f'model_p2w_{rn}.pth'
 
 
-def split_stations_by_clusters(data, n_clusters=25, n_train_clusters=13, random_seed=42):
+def split_stations_by_clusters(data, n_clusters=25, n_train_clusters=7, random_seed=42):
     """
     Splits coordinate-based station data into train and test sets using spatial clustering.
 
@@ -211,7 +197,7 @@ def has_significant_slope(ts, window_size=7, range_thresh=0.2, outlier_threshold
 
 def test(cfg, train=True):
     if not os.path.exists('data/split.pkl'):
-        with open('data/selected_stats_rainfall_segment.pkl', 'rb') as f:
+        with open('data/selected_stats_segment.pkl', 'rb') as f:
             data = pickle.load(f)
 
         good_nb_extended, test_nb = split_stations_by_clusters(data)
@@ -228,47 +214,59 @@ def test(cfg, train=True):
             good_nb_extended = split['train']
             test_nb = split['test']
 
-    train_dataset = WaterDatasetX(
+    # 🔹 1️⃣ Define Device (Multi-GPU)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = 'cpu'
+
+    train_dataset = WaterDataset(
         path='data/selected_stats_rainfall_segment.pkl', train=True,
-        selected_stations=good_nb_extended
+        selected_stations=good_nb_extended, input_type=cfg.dataset.inputs
     )
     train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
 
-    # Define spatial kernel (e.g., Matern)
-    # kernel = RBF(length_scale=1.0, length_scale_bounds=(1e-6, 1e3))
-    kernel = RBF(length_scale=1.0, length_scale_bounds=(1e-2, 1e3))
-    model = SpatioTemporalNNGP(
-        kernel=kernel,
-        alpha=1e-6,  # jitter for numerical stability
-        phi=0.8,     # autoregressive temporal parameter (typically between -1 and 1)
-        tau2=0.1     # observation noise variance
-    )
+    # 🔹 2️⃣ Initialize Model
+    model = instantiate_from_config(cfg.model).to(device)
+    model = model.to(device)
+
+    mse_loss = nn.MSELoss()
 
     # Training loop
-    ckpt_name = 'model.nngp.SpatioTemporalNNGP.pkl'
+    num_epochs = 50
 
-    if not os.path.exists(ckpt_name):
-        all_xs = []
-        all_y = []
-        for xs, y, lrain in tqdm(train_loader, desc=f"Training", leave=False):
-            y = y.squeeze(0).detach().cpu().numpy()
-            xs = xs.repeat(lrain.shape[1], 1).detach().cpu().numpy()
-            lrain = lrain.squeeze(0).unsqueeze(-1).detach().cpu().numpy()
+    ckpt_name = get_checkpoint_name(cfg=cfg)
+    if train:
+        list_loss = []
+        epoch_bar = tqdm(range(num_epochs), desc="Epochs")  # Initialize tqdm for epochs
+        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        for epoch in epoch_bar:
+            for x, xs, y, kes, lrain, nrain, valid, loc in tqdm(train_loader, desc=f"Training Epoch {epoch+1}", leave=False):
+                x = x.to(device)
+                nrain = nrain.to(device)
 
-            all_xs.append(np.concatenate([xs, lrain], axis=-1))
-            all_y.append(y)
+                # Forward pass
+                o = model(x, nrain)
 
-        X_flat = np.concatenate(all_xs, axis=0)
-        y_flat = np.concatenate(all_y, axis=0)
-        model.fit(X_flat, y_flat.reshape(-1, 1))
+                # Compute L1 loss on all elements
+                loss = mse_loss(o, x)
 
-        with open(ckpt_name, 'wb') as f:
-            pickle.dump(model, f)
-    else:
-        with open(ckpt_name, 'rb') as f:
-            model = pickle.load(f)
-    
-    test_dataset = WaterDatasetY(
+                # Backward pass
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                    
+                # Print loss for every epoch
+                epoch_bar.set_description(f"Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}")
+                list_loss.append(loss.item())
+
+            # Save model checkpoint every 5 epochs
+            torch.save(model.state_dict(), ckpt_name)
+        
+    if ckpt_name is not None:
+        model.load_state_dict(torch.load(ckpt_name), strict=False)
+        model.eval()
+
+    rn = cfg.model['target']
+    test_dataset = WaterDataset(
         path='data/selected_stats_rainfall_segment.pkl', train=False,
         selected_stations=test_nb, input_type=cfg.dataset.inputs
     )
@@ -279,48 +277,37 @@ def test(cfg, train=True):
             'loss': [],
             'gain': [],
             'tgts': [],
-            'outs': []
+            'outs': [],
         } for k in range(len(list(test_dataset.data.keys())))
     }
-
-    # for idx, (mxs, my, mlrain, mnbxs, mnby, mnrain) in enumerate(test_loader):
-    #     pass
-    # exit()
 
     seg_len = 168
     total_elapsed = 0
     total_n = 0
+    loss_all = []
+    corr_all = []
     with torch.no_grad():
-        for idx, (mxs, my, mlrain, mnbxs, mnby, mnrain, loc) in enumerate(test_loader):
+        for idx, (mx, _, my, _, _, mnrain, _, _) in enumerate(test_loader):
+            start = time.time()
             outs = []
             tgts = []
-            cors = []
             gain = []
-            for i in range(my.shape[-1] // seg_len):
-                start_time = time.time()
-                y = my[:, i*seg_len:(i+1)*seg_len].detach().cpu().numpy()
-                nby = mnby[:, :, i*seg_len:(i+1)*seg_len].detach().cpu().numpy()
-                nxs = mnbxs.detach().cpu().numpy()
-                xs = mxs.detach().cpu().numpy()
-                lrain = mlrain[:, i*seg_len:(i+1)*seg_len].detach().cpu().numpy()
-                nrain = mnrain[:, :, i*seg_len:(i+1)*seg_len].detach().cpu().numpy()
-                
-                y = np.expand_dims(y[0], axis=-1)
-                xs = xs.repeat(y.shape[0], axis=0)
-                lrain = np.expand_dims(lrain[0], axis=-1)
-                all_xs = np.concatenate([xs, lrain], axis=-1)
+            for i in range(mx.shape[2] // seg_len):
+                start = time.time()
+                x = mx[:, :, i*seg_len:(i+1)*seg_len].to(device)
+                nrain = mnrain[:, :, i*seg_len:(i+1)*seg_len].to(device)
+                y = my[:, i*seg_len:(i+1)*seg_len].to(device)
 
-                if not has_significant_slope(y[:, 0]):
+                if not has_significant_slope(y[0].detach().cpu().numpy()):
                     continue
 
-                nby = np.expand_dims(nby[0], axis=-1).transpose(1, 0, 2)
-                nxs = nxs.repeat(y.shape[0], axis=0)
-                nrain = np.expand_dims(nrain[0], -1).transpose(1, 0, 2)
-                all_nxs = np.concatenate([nxs, nrain], axis=-1)
+                if y[0].max() < 0.5:
+                    continue
 
-                o = model.predict(all_nxs, nby, all_xs)[:, 0]
+                o = model(x, nrain)
 
-                total_elapsed += time.time() - start_time
+                elapsed = time.time() - start
+                total_elapsed += elapsed
                 total_n += 1
 
                 # print(o.shape, x.shape, y.shape)
@@ -344,27 +331,21 @@ def test(cfg, train=True):
                 # exit()
                 # o1 = idw(xs, x, inputs=cfg.dataset.inputs, train=False, stage=-1)
 
-                o = o.flatten()
-                y = y.flatten()
+                o_np = o.flatten().detach().cpu().numpy()
+                x_np = x.flatten().detach().cpu().numpy()
 
                 outs.extend(
-                    o
+                    o_np
                 )
                 tgts.extend(
-                    y
-                )
-                cors.append(
-                    pearson_corrcoef(
-                        o,
-                        y
-                    )
+                    x_np
                 )
                 gain.extend(
-                    (y - o).tolist()
+                    (x_np - o_np).tolist()
                 )
 
-                if np.abs(y).max() > 0.5 and np.abs(y).max() < 1.0:
-                    plot_graph(o, y, nby, f'{loc.numpy()}-{idx}-{i}')
+                # if torch.abs(y).max() > 0.5 and torch.abs(y).max() < 1.0:
+                #     plot_graph(o, y, x, f'{loc.numpy()}-{idx}-{i}_{rn}')
 
             outs = np.array(outs)
             tgts = np.array(tgts)
@@ -374,16 +355,31 @@ def test(cfg, train=True):
                     outs,
                     tgts
                 )
+
                 results[idx]['corr'].append(cor)
                 results[idx]['loss'].append(se)
                 results[idx]['gain'].append(gain)
                 results[idx]['tgts'].append(tgts)
                 results[idx]['outs'].append(outs)
+                corr_all.append(cor)
+                loss_all.extend(se)
 
     print(f'Total Elapsed: {total_elapsed:.6f} seconds, Average time per segment: {total_elapsed / total_n:.6f} seconds')
+    loss = np.array(loss_all)
+    corr = np.array(corr_all)
+    print(np.mean(loss), np.mean(corr))
+    # stm: 0.34381017 0.354788613727146
+    # cgru: 0.32168755 0.4462470519091705
+    # gru: 0.33668485 0.4309533541763729
+    # mlp: 0.33610648 0.41939733343606117
+    # mlp2: 0.3301921 0.3744572715679498
 
-    with open(f'{ckpt_name}-results.pkl', 'wb') as f:
-        pickle.dump(results, f)
+    # mlp 0.5874386 0.34767955272802337
+    # mlp2 0.5836547 0.3314928786040023
+    # min_gru 0.5867267 0.36448541480162644
+    # gru 0.58060926 0.39438870440330126
+    # with open(f'{rn}-results.pkl', 'wb') as f:
+    #     pickle.dump(results, f)
 
 
 def main():
@@ -402,7 +398,7 @@ def main():
         print('-----Training-----')
         test(cfg, train=True)
         
-    print('-----Testing-----')
+    # print('-----Testing-----')
     test(cfg, train=False)
 
 

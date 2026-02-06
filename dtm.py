@@ -17,6 +17,7 @@ from shapely.geometry import MultiPoint
 from common.dsm import *
 from common.graph import *
 from common.vis import *
+from scripts.add_width_to_data import l2_distance
 
 
 def compute_waterway_elevation_statistics(cropped_dsm, centerline_coords):
@@ -397,7 +398,7 @@ if __name__ == "__main__":
     with open('data/bounds.pkl', 'rb') as f:
         dict_bounds = pickle.load(f)
 
-    with open('data/selected_stats_rainfall_segment.pkl', 'rb') as f:
+    with open('data/data_with_width.pkl', 'rb') as f:
         data_dict = pickle.load(f)
 
     selected_areas = [
@@ -409,16 +410,19 @@ if __name__ == "__main__":
     loading_dict = {}
     for station_key in data_dict.keys():
         station_data = data_dict[station_key]
-        for ref_location in station_data['neighbor'].keys():
-            if ref_location not in station_data['neighbor'] or 'nodes' not in station_data['neighbor'][ref_location].keys():
+        for ref_location in station_data['graph'].keys():
+            if ref_location not in station_data['graph'] or 'nodes' not in station_data['graph'][ref_location].keys():
                 nodes = [station_key, ref_location]
             else:
-                nodes = station_data['neighbor'][ref_location]['nodes']
+                nodes = station_data['graph'][ref_location]['nodes']
                 if nodes is not None:
-                    nodes = [station_key, *nodes, ref_location]
+                    if l2_distance(nodes[0], station_key) < l2_distance(nodes[-1], station_key):
+                        nodes = [station_key, *nodes, ref_location]
+                    else:
+                        nodes = [ref_location, *nodes, station_key]
                 else:
                     nodes = [station_key, ref_location]
-            
+
             tiles = []
             for n in nodes: 
                 tile = find_tile_for_location(dict_bounds, n[::-1])
@@ -486,9 +490,9 @@ if __name__ == "__main__":
             graph_nodes = station_data['sim_graph']['nodes']
 
             path_flag = True
-            if ref_location not in station_data['neighbor'] or 'nodes' not in station_data['neighbor'][ref_location].keys():
+            if ref_location not in station_data['graph'] or 'nodes' not in station_data['graph'][ref_location].keys():
                 path_flag = False
-            elif station_data['neighbor'][ref_location]['nodes'] is  None:
+            elif station_data['graph'][ref_location]['nodes'] is  None:
                 path_flag = False
             print('Has path ......')
             t0 = time.time()
@@ -556,5 +560,5 @@ if __name__ == "__main__":
             del slope_deg
             gc.collect()
     
-    # with open(f'data/selected_stats_rainfall.pkl', 'wb') as f:
+    # with open(f'new_data_2.pkl', 'wb') as f:
     #     pickle.dump(data_dict, f)

@@ -1,0 +1,9 @@
+model:
+  target: model.p2w.MinimalSpatialTemporalMixer
+  params:
+    d_model: 24
+    n_heads: 1
+    num_layers: 3
+
+dataset:
+  inputs: 'update'

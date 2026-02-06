@@ -216,7 +216,7 @@ def test(cfg, train=True):
 
         for epoch in epoch_bar:
             model.train()
-            for y, x, valid, graph_data, fx, r, _ in tqdm(train_loader, desc=f"Training Epoch {epoch+1}", leave=False):
+            for y, x, valid, graph_data, fx, r, _, _ in tqdm(train_loader, desc=f"Training Epoch {epoch+1}", leave=False):
                 valid = valid.float().to(device)
                 y = y.to(device).float()
                 x = x.to(device).float()
@@ -271,7 +271,7 @@ def test(cfg, train=True):
 
     seg_len = 168
     with torch.no_grad():
-        for idx, (my, mx, mvalid, graph_data, mfx, mr, loc) in enumerate(test_loader):
+        for idx, (my, mx, mvalid, graph_data, mfx, mr, loc, _) in enumerate(test_loader):
             mnodes = graph_data.x.unsqueeze(-1)
             edge_index = graph_data.edge_index.to(device)
             edge_attr = graph_data.edge_attr.to(device)
@@ -288,7 +288,7 @@ def test(cfg, train=True):
                 valid = mvalid[:, :, i*seg_len:(i+1)*seg_len].to(device)
                 y = my[:, i*seg_len:(i+1)*seg_len].to(device)
                 nodes = mnodes[:, i*seg_len:(i+1)*seg_len]
-                r = mr[:, :, i*seg_len:(i+1)*seg_len].to(device)
+                # r = mr[:, :, i*seg_len:(i+1)*seg_len].to(device)
                 fx = mfx
 
                 nodes = nodes.to(device)
@@ -299,7 +299,7 @@ def test(cfg, train=True):
                     continue
 
                 # Forward pass
-                o = model(nodes, edge_index, edge_attr, valid, r, fx)
+                o = model(nodes, edge_index, edge_attr, valid, None, fx)
                 # from calflops import calculate_flops
                 # inputs = {}
                 # inputs["nodes"] = nodes

@@ -325,6 +325,66 @@ class MLPW(nn.Module):
         return torch.sum(x * alpha, dim=0, keepdim=True)
     
 
+def gaussian_variogram(h, nugget=0.0, sill=1.0, range_=1.0):
+    return nugget + sill * (1.0 - torch.exp(- (h ** 2) / (range_ ** 2)))
+
+
+def pairwise_distances(x1, x2):
+    x1_sq = torch.sum(x1**2, dim=1, keepdim=True)          # [N, 1]
+    x2_sq = torch.sum(x2**2, dim=1, keepdim=True)          # [M, 1]
+    dist_sq = x1_sq - 2 * (x1 @ x2.T) + x2_sq.T            # [N, M] -> if x1 is train, x2 is pred, transpose accordingly
+    return torch.sqrt(torch.clamp(dist_sq, min=1e-12))
+
+
+def ordinary_kriging(train_coords, train_values, pred_coords, variogram_fn, eps=1e-8):
+    """
+    Ordinary Kriging (vectorized over prediction points).
+    Shapes:
+      train_coords: [N, D]
+      train_values: [N] or [N, 1]
+      pred_coords : [M, D]
+    Returns:
+      preds: [M]
+    """
+    # Ensure proper shapes/dtypes/devices
+    device = train_coords.device
+    dtype = train_coords.dtype
+    train_coords = train_coords.reshape(train_coords.shape[0], -1).to(device=device, dtype=dtype)
+    pred_coords  = pred_coords.reshape(pred_coords.shape[0],  -1).to(device=device, dtype=dtype)
+
+    N = train_coords.shape[0]
+    M = pred_coords.shape[0]
+
+    # Build (N+1)x(N+1) kriging matrix with Lagrange multiplier
+    d_train = pairwise_distances(train_coords, train_coords)        # [N, N]
+    gamma_tt = variogram_fn(d_train)                                # [N, N]
+
+    K = torch.zeros((N+1, N+1), dtype=dtype, device=device)
+    K[:N, :N] = gamma_tt
+    K[N, :N] = 1.0
+    K[:N, N] = 1.0
+    # K[N, N] = 0.0  # already zero
+
+    # Stable inverse
+    K_inv = torch.linalg.inv(K + eps * torch.eye(N+1, device=device, dtype=dtype))
+
+    # RHS for all M predictions at once
+    d_pt = pairwise_distances(pred_coords, train_coords)            # [M, N]
+    gamma_pt = variogram_fn(d_pt)                                   # [M, N]
+    ones = torch.ones((M, 1), device=device, dtype=dtype)
+    k = torch.cat([gamma_pt, ones], dim=1)                          # [M, N+1]
+
+    # Weights for all M: (K_inv @ k_i) for each i -> [M, N+1]
+    weights = (K_inv @ k.T).T                                       # [M, N+1]
+    w = weights[:, :-1].squeeze(0).unsqueeze(-1)
+    w = w / torch.sum(w, dim=0, keepdim=True)
+
+    # Predictions: sum_j w_ij * z_j
+    preds = (w * train_values).sum(dim=0, keepdim=True)              # [M]
+
+    return preds
+
+
 def forward_distance(xs, x):
     """
     xs: Feature vectors of neighboring stations - batch x stations x channels
@@ -406,6 +466,147 @@ class GATWithEdgeAttrRain(torch.nn.Module):
                 res_idx = i
                 break
         return res_idx
+    
+
+def krig_pred(w_train: torch.Tensor,
+              coord_train: torch.Tensor,
+              coord_test: torch.Tensor,
+              theta: tuple[float, float, float],
+              neighbor_size: Optional[int] = 20,
+              q: Optional[float] = 0.95
+              ) -> torch.Tensor:
+    """Kriging prediction (Gaussian process regression) with confidence interval.
+
+    Kriging prediction on testing locations based on the observations on the training locations. The kriging procedure
+    assumes the observations are sampled from a Gaussian process, which is paramatrized here to have an exponential covariance
+    structure using theta = [sigma^2, phi, tau]. NNGP appriximation is involved for efficient computation of matrix inverse.
+    The conditional variance (kriging variance) is used to build the confidence interval using the quantiles (a/2, 1-a/2).
+    (see https://arxiv.org/abs/2304.09157, section 4.3 for more details.)
+
+    Parameters:
+        w_train:
+            Training observations of the spatial random effect without any fixed effect.
+        coord_train:
+            Spatial coordinates of the training observations.
+        coord_test:
+            Spatial coordinates of the locations for prediction
+        theta:
+            theta[0], theta[1], theta[2] represent sigma^2, phi, tau in the exponential covariance family.
+        neighbor_size:
+            The number of nearest neighbors used for NNGP approximation. Default being 20.
+        q:
+            Confidence coverage for the prediction interval. Default being 0.95.
+
+    Returns:
+        w_test: torch.Tensor
+            The kriging prediction.
+        pred_U: torch.Tensor
+            Confidence upper bound.
+        pred_L: torch.Tensor
+            Confidence lower bound.
+
+    See Also:
+        Zhan, Wentao, and Abhirup Datta. 2024. “Neural Networks for Geospatial Data.”
+        Journal of the American Statistical Association, June, 1–21. doi:10.1080/01621459.2024.2356293.
+    """
+    sigma_sq, phi, tau = theta
+    tau_sq = tau * sigma_sq
+    n_test = coord_test.shape[0]
+
+    rank = make_rank(coord_train, neighbor_size, coord_test)
+
+    w_test = torch.zeros(n_test)
+    sigma_test = (sigma_sq + tau_sq) * torch.ones(n_test)
+    for i in range(n_test):
+        ind = rank[i, :]
+        cov_sub = make_cov_full(distance(coord_train[ind, :], coord_train[ind, :]), theta, nuggets=True)
+        cov_vec = make_cov_full(distance(coord_train[ind, :], coord_test[i, :]), theta, nuggets=False).reshape(-1)
+        bi = torch.linalg.solve(cov_sub, cov_vec)
+        w_test[i] = torch.dot(bi.T, w_train[ind]).squeeze()
+        sigma_test[i] = sigma_test[i] - torch.dot(bi.reshape(-1), cov_vec)
+    p = scipy.stats.norm.ppf((1 + q) / 2, loc=0, scale=1)
+    sigma_test = torch.sqrt(sigma_test)
+    pred_U = w_test + p * sigma_test
+    pred_L = w_test - p * sigma_test
+
+    return w_test, pred_U, pred_L
+
+
+def make_cov_full(dist: torch.Tensor | np.ndarray,
+                  theta: tuple[float, float, float],
+                  nuggets: Optional[bool] = False,
+                  ) -> torch.Tensor | np.ndarray:
+    """Compose covariance matrix from the distance matrix with dense representation.
+
+    Compose a covariance matrix in the exponential covariance family (other options to be implemented) from the distance
+    matrix. The returned object class depends on the input distance matrix.
+
+    Parameters:
+        dist:
+            The nxn distance matrix
+        theta:
+            theta[0], theta[1], theta[2] represent sigma^2, phi, tau in the exponential covariance family.
+        nuggets:
+            Whether to include nuggets term in the covariance matrix (added to the diagonal).
+
+    Returns:
+        cov:
+            A covariance matrix.
+    """
+    sigma_sq, phi, tau = theta
+    tau_sq = tau * sigma_sq
+    if isinstance(dist, float) or isinstance(dist, int):
+        dist = torch.Tensor(dist)
+        n = 1
+    else:
+        n = dist.shape[-1]
+    if isinstance(dist, torch.Tensor):
+        cov = sigma_sq * torch.exp(-phi * dist)
+    else:
+        cov = sigma_sq * np.exp(-phi * dist)
+    if nuggets:
+        shape_temp = list(cov.shape)[:-2] + [1 ,1]
+        if isinstance(dist, torch.Tensor):
+            cov += tau_sq * torch.eye(n).repeat(*shape_temp).squeeze()
+        else:
+            cov += tau_sq * np.eye(n).squeeze() #### need improvement
+    return cov
+
+
+def make_rank(coord: torch.Tensor,
+              neighbor_size: int,
+              coord_ref = None
+              ) -> np.ndarray:
+    """Compose the nearest neighbor index list based on the coordinates.
+
+    Find the indexes of nearest neighbors in reference set for each location i in the main set.
+    The index is based on the increasing order of the distances between ith location and the locations in the reference set.
+
+    Parameters:
+        coord:
+            The nxd coordinates array of target locations.
+        neighbor_size:
+        `   Suppose neighbor_size = k, only the top k-nearest indexes will be returned.
+        coord_ref:
+            The n_refxd coordinates array of reference locations. If None, use the target set itself as the reference.
+            (Any location's neighbor does not include itself.)
+
+    Returns:
+        rank_list:
+            A nxp array. The ith row is the indexes of the nearest neighbors for the ith location, ordered by the distance.
+    """
+    if coord_ref is None:
+        neighbor_size += 1
+
+    knn = NearestNeighbors(n_neighbors=neighbor_size)
+    knn.fit(coord.detach().numpy())
+    if coord_ref is None:
+        coord_ref = coord
+        rank = knn.kneighbors(coord_ref)[1]
+        return rank[:, 1:]
+    else:
+        rank = knn.kneighbors(coord_ref)[1]
+        return rank[:, 0:]
 
 
 def distance(coord1: torch.Tensor,

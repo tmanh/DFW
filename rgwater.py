@@ -18,7 +18,7 @@ import pickle
 
 from tqdm import tqdm
 
-from model.gnn import GATWithEdgeAttr, GATWithEdgeAttrRain
+from model.gnn import GATWithEdgeAttrRain
 from model.mlp import *
 from water_level import has_significant_slope, split_stations_by_clusters
 
@@ -117,7 +117,7 @@ def location_aware_loss(o, y, loc_list):
 
 
 def create_model(device):
-    model = GATWithEdgeAttrRain(2, 18, 1, 1).to(device)
+    model = GATWithEdgeAttrRain().to(device)
     return model
 
 
@@ -174,10 +174,114 @@ def std_loss(y_pred, y_true):
     """
     Computes the absolute difference between the std of prediction and target.
     """
-    return torch.abs(torch.std(y_pred) - torch.std(y_true))
+    std_loss_val = torch.abs(torch.std(y_pred) - torch.std(y_true))
+    return std_loss_val
 
 
-def test(cfg, train=True):
+class QuarticLoss(nn.Module):
+    def __init__(self, reduction='mean'):
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(self, pred, target):
+        # Compute element-wise error
+        error = pred - target
+        # Raise to the 4th power
+        loss = error ** 4
+        # Apply reduction
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+        
+
+class MixLoss(nn.Module):
+    def __init__(self, reduction='mean'):
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(self, pred, target):
+        # Compute element-wise error
+        error = pred - target
+        # Raise to the 4th power
+        loss = (error ** 2 + error ** 4) / 2
+        # Apply reduction
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
+
+def spike_aware_loss(pred, target, base_loss_fn=torch.nn.MSELoss(), eps=1e-6):
+    # Compute absolute difference between consecutive time steps
+    target_diff = torch.abs(target[:, 1:] - target[:, :-1])  # (B, T-1)
+    spike_weight = torch.nn.functional.pad(target_diff, (1, 0)) + eps  # Pad to align shape (B, T)
+    
+    # Normalize weights
+    spike_weight = spike_weight / spike_weight.mean(dim=1, keepdim=True)
+
+    # Base loss
+    base_loss = base_loss_fn(pred, target)
+
+    # Weight the loss
+    weighted_loss = (base_loss * spike_weight).mean()
+    return weighted_loss
+
+
+def loss_fn(loss_f, o, y, pearson=True, std=True):
+    if o.shape[0] == 0:
+        return torch.tensor(0.0, device=o.device)
+
+    loss = loss_f(o, y)
+    if pearson:
+        loss -= pearson_corrcoef(o.squeeze(-1), y.squeeze(-1))[0]
+    
+    if std:
+        loss += std_loss(o, y)
+
+    return loss
+
+
+def top_p_mask_global(y, p=0.2):
+    flat = y.reshape(-1)
+    k = max(1, int(math.ceil(flat.numel() * p)))
+    _, idx = torch.topk(flat, k)
+    m = torch.zeros_like(flat, dtype=torch.bool)
+    m[idx] = True
+    return m.view_as(y)
+
+
+def topk_mse(pred: torch.Tensor, target: torch.Tensor, top_percent: float = 0.1) -> torch.Tensor:
+    """
+    Compute MSE using only the top x% of samples with the highest squared error.
+
+    Args:
+        pred (torch.Tensor): Predictions (any shape).
+        target (torch.Tensor): Ground truth (same shape as pred).
+        top_percent (float): Fraction (0 < top_percent <= 1) of samples to use,
+                             e.g., 0.1 = top 10%.
+
+    Returns:
+        torch.Tensor: Scalar MSE over the top x% errors.
+    """
+    assert pred.shape == target.shape, "Prediction and target must have the same shape"
+    assert 0 < top_percent <= 1, "top_percent must be in (0,1]"
+
+    # flatten to 1D
+    errors = (pred - target).view(-1) ** 2
+    k = max(1, int(len(errors) * top_percent))
+
+    # get top-k largest errors
+    topk_errors, _ = torch.topk(errors, k)
+
+    return topk_errors.mean()
+
+
+def test(cfg, train=True, ckpt_path='model_rgnn.pth', top=0.2):
     if not os.path.exists('data/split.pkl'):
         with open('data/selected_stats_rainfall_segment.pkl', 'rb') as f:
             data = pickle.load(f)
@@ -204,6 +308,11 @@ def test(cfg, train=True):
         selected_stations=good_nb_extended, input_type=cfg.dataset.inputs
     )
     train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=0)  # Adjust batch_size as needed
+    
+    test_dataset = GWaterDataset(
+        path='data/selected_stats_rainfall_segment.pkl', train=False,
+        selected_stations=test_nb, input_type=cfg.dataset.inputs
+    )
 
     # Initialize model and wrap it with DataParallel
     model = create_model(device)
@@ -213,17 +322,20 @@ def test(cfg, train=True):
         model.to(device)
 
     # Define loss function and optimizer
-    l1_loss = nn.HuberLoss()
+    l2_loss = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
     if train:
-        num_epochs = 100
+        num_epochs = 20
         list_loss = []
         epoch_bar = tqdm(range(num_epochs), desc="Epochs")  # tqdm for epochs
 
         for epoch in epoch_bar:
             model.train()
-            for y, x, valid, graph_data, fx, r, loc in tqdm(train_loader, desc=f"Training Epoch {epoch+1}", leave=False):
+
+            epoch_loss = 0.0
+            num_batches = 0
+            for y, x, valid, graph_data, fx, r, loc, earray in tqdm(train_loader, desc=f"Training Epoch {epoch+1}", leave=False):
                 valid = valid.float().to(device)
                 y = y.to(device).float()
                 x = x.to(device).float()
@@ -233,28 +345,51 @@ def test(cfg, train=True):
                 fx = fx.to(device)
                 r = r.to(device)
                 loc = loc.to(device)
+                earray = earray.to(device)
 
                 # Forward pass
-                o, rf = model(nodes, edge_index, edge_attr, valid, r, fx, loc)
-
+                o, rf, rff, valid = model(nodes, edge_index, edge_attr, valid, r, fx, loc, earray)
+                
                 # Compute loss
-                loss = l1_loss(o, y) + l1_loss(rf, y)# - pearson_corrcoef(o, y) - pearson_corrcoef(rf, y)
-                loss += (std_loss(o, y) + std_loss(rf, y))
+                pearson_flag = False
+                std_flag = False
+
+                mask = top_p_mask_global(y, p=top) if top < 1.0 else 1.0
+                loss = loss_fn(l2_loss, o[:1][mask], y[mask], pearson=pearson_flag, std=std_flag)
+                loss += loss_fn(l2_loss, rf[:1][mask], y[mask], pearson=pearson_flag, std=std_flag)
+                loss += loss_fn(l2_loss, rf[:1], y, pearson=pearson_flag, std=std_flag)
+                loss += loss_fn(
+                    l2_loss,
+                    rff[1:],
+                    nodes[1:rf.shape[0]],
+                    pearson=pearson_flag,
+                    std=std_flag
+                )
+                loss += loss_fn(
+                    l2_loss,
+                    rf[1:],
+                    nodes[1:rf.shape[0]].squeeze(-1),
+                    pearson=pearson_flag,
+                    std=std_flag
+                )
 
                 # Backward pass
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
 
+                epoch_loss += loss.item()
+                num_batches += 1
+
                 # Print loss for each epoch
-                epoch_bar.set_description(f"Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}")
+                epoch_bar.set_description(f"Epoch [{epoch+1}/{num_epochs}], Loss: {(epoch_loss / num_batches):.4f}")
                 list_loss.append(loss.item())
 
         # Save model periodically
-        torch.save(model.state_dict(), 'model_rgnn.pth')
+        torch.save(model.state_dict(), ckpt_path)
 
     # Load trained model for evaluation
-    model.load_state_dict(torch.load('model_rgnn.pth'))
+    model.load_state_dict(torch.load(ckpt_path))
     model.eval()
     model.to(device)
 
@@ -281,13 +416,14 @@ def test(cfg, train=True):
     total_elapsed = 0
     total_n = 0
     with torch.no_grad():
-        for idx, (my, mx, mvalid, graph_data, mfx, mr, loc) in enumerate(test_loader):
+        for idx, (my, mx, mvalid, graph_data, mfx, mr, loc, earray) in enumerate(test_loader):
             mnodes = graph_data.x.unsqueeze(-1)
             edge_index = graph_data.edge_index.to(device)
             edge_attr = graph_data.edge_attr.to(device)
             mfx = mfx.to(device)
             mr = mr.to(device)
             loc = loc.to(device)
+            earray = earray.to(device)
             
             outs = []
             tgts = []
@@ -310,7 +446,9 @@ def test(cfg, train=True):
                     continue
 
                 # Forward pass
-                o, _ = model(nodes, edge_index, edge_attr, valid, r, fx, loc)
+                o, rf, rff, _ = model(nodes, edge_index, edge_attr, valid, r, fx, loc, earray)
+                o = o[:1]
+
                 elapsed = time.time() - start
                 total_elapsed += elapsed
                 total_n += 1
@@ -367,11 +505,17 @@ def test(cfg, train=True):
                 results[idx]['gain'].append(gain)
                 results[idx]['tgts'].append(tgts)
                 results[idx]['outs'].append(outs)
+                results[idx]['loc'] = loc.detach().cpu().numpy()
+
+        for k in results.keys():
+            print(f"Key: {k} - {results[k]['loc'] if 'loc' in results[k] else 'No Location'}, Output: {results[k]['outs'][0].shape if len(results[k]['outs']) > 0 else 0}")
+    
     print(f'Total Elapsed: {total_elapsed:.6f} seconds, Average time per segment: {total_elapsed / total_n:.6f} seconds')
 
     rn = cfg.model['target']
-    with open(f'g-{rn}-results.pkl', 'wb') as f:
+    with open(f'g-{rn}-results-all-d{top}.pkl', 'wb') as f:
         pickle.dump(results, f)
+    print('Results saved.')
 
 
 def main():
@@ -384,13 +528,17 @@ def main():
     parser = argparse.ArgumentParser(description="Run the test function with configurable parameters.")
     parser.add_argument("--cfg", type=str, help="Config file path", default="config/rgnn.yaml")
     parser.add_argument("--training", action="store_true", help="Enable training mode (default: False)")
+    parser.add_argument("--ckpt", type=str, default="model_rgnn.pth", help="Path to save/load the model checkpoint")
+    parser.add_argument("--top", type=float, default=0.2, help="Top p% stations to compute loss")
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.cfg)
 
-    with open("log-test-all.txt", "w") as f:
-        # test(cfg, train=True)
-        test(cfg, train=False)
+    ckpt_path = args.ckpt
+    top = args.top
+    test(cfg, train=True, ckpt_path=ckpt_path, top=top)
+    test(cfg, train=False, ckpt_path=ckpt_path, top=top)
 
 
-main()
+if __name__ == "__main__":
+    main()
