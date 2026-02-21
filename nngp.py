@@ -237,17 +237,12 @@ def test(cfg, train=True):
     # Define spatial kernel (e.g., Matern)
     # kernel = RBF(length_scale=1.0, length_scale_bounds=(1e-6, 1e3))
     kernel = RBF(length_scale=1.0, length_scale_bounds=(1e-2, 1e3))
-    model = SpatioTemporalNNGP(
-        kernel=kernel,
-        alpha=1e-6,  # jitter for numerical stability
-        phi=0.8,     # autoregressive temporal parameter (typically between -1 and 1)
-        tau2=0.1     # observation noise variance
-    )
+    model = SpatioTemporalNNGP()
 
     # Training loop
     ckpt_name = 'model.nngp.SpatioTemporalNNGP.pkl'
 
-    if not os.path.exists(ckpt_name):
+    if True:
         all_xs = []
         all_y = []
         for xs, y, lrain in tqdm(train_loader, desc=f"Training", leave=False):
@@ -260,6 +255,7 @@ def test(cfg, train=True):
 
         X_flat = np.concatenate(all_xs, axis=0)
         y_flat = np.concatenate(all_y, axis=0)
+
         model.fit(X_flat, y_flat.reshape(-1, 1))
 
         with open(ckpt_name, 'wb') as f:
@@ -310,7 +306,11 @@ def test(cfg, train=True):
                 lrain = np.expand_dims(lrain[0], axis=-1)
                 all_xs = np.concatenate([xs, lrain], axis=-1)
 
-                if not has_significant_slope(y[:, 0]):
+                loc_vals = y[:, 0]
+                if not has_significant_slope(loc_vals):
+                    continue
+                delta = abs(np.max(loc_vals) - np.min(loc_vals))
+                if delta <= 0.3:
                     continue
 
                 nby = np.expand_dims(nby[0], axis=-1).transpose(1, 0, 2)
@@ -318,7 +318,7 @@ def test(cfg, train=True):
                 nrain = np.expand_dims(nrain[0], -1).transpose(1, 0, 2)
                 all_nxs = np.concatenate([nxs, nrain], axis=-1)
 
-                o = model.predict(all_nxs, nby, all_xs)[:, 0]
+                o = model.predict(all_nxs, nby, all_xs)[0]
 
                 total_elapsed += time.time() - start_time
                 total_n += 1

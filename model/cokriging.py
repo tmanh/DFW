@@ -1,590 +1,218 @@
-"""
-Cokriging Implementation
-========================
-This module implements Ordinary Cokriging for spatial interpolation using
-multiple correlated variables to improve predictions.
-"""
-
 import numpy as np
 from scipy.spatial.distance import cdist
-from scipy.linalg import solve
-import matplotlib.pyplot as plt
-from typing import Tuple, Optional, List, Dict
+from scipy.linalg import cho_factor, cho_solve
 
 
-class OrdinaryCokriging:
+def _corr(h, model="gaussian", range_=4.0):
+    h = np.asarray(h, float)
+    range_ = float(max(range_, 1e-12))
+    if model == "gaussian":
+        return np.exp(-3.0 * (h / range_) ** 2)
+    if model == "exponential":
+        return np.exp(-3.0 * h / range_)
+    if model == "spherical":
+        hr = h / range_
+        return np.where(h <= range_, 1.0 - (1.5 * hr - 0.5 * hr**3), 0.0)
+    raise ValueError(f"Unknown corr model: {model}")
+
+
+class CachedOKCKIntrinsic:
     """
-    Ordinary Cokriging implementation.
-    
-    Cokriging uses multiple correlated spatial variables jointly to make
-    predictions. The primary variable is predicted using both its own spatial
-    correlation structure and cross-correlations with secondary variables.
-    
-    Parameters
-    ----------
-    variogram_models : dict
-        Variogram models for each variable and cross-variograms.
-        Keys should be: 'var0' (primary), 'var1', 'var2', ... (secondary),
-        and 'cross_01', 'cross_02', etc. for cross-variograms.
-        Values are tuples: (model_type, params)
-        Example: {'var0': ('spherical', {'sill': 1.0, 'range': 10.0, 'nugget': 0.1})}
-    n_variables : int
-        Number of variables (primary + secondary)
+    Ordinary cokriging (primary + secondary) using an Intrinsic Coregionalization Model (ICM):
+        C11(h) = sill1 * rho(h)
+        C22(h) = sill2 * rho(h)
+        C12(h) = r12 * sqrt(sill1*sill2) * rho(h)
+    (guaranteed PSD if |r12|<=1 and sills>=0)
+
+    OKCK constraints for unknown means per variable:
+        sum weights (primary data)   = 1
+        sum weights (secondary data) = 0
+    i.e. f0 = [1, 0]^T
+
+    This class caches weights for ONE prediction location x0, for repeated timesteps.
     """
-    
-    def __init__(self, variogram_models: Dict[str, Tuple[str, dict]], 
-                 n_variables: int = 2):
-        self.variogram_models = variogram_models
-        self.n_variables = n_variables
-        
-        # Fitted data
-        self.X_train = {}  # Dictionary of training coordinates for each variable
-        self.y_train = {}  # Dictionary of training values for each variable
-        self.n_samples = {}  # Number of samples per variable
-        
-    def _variogram(self, h: np.ndarray, var_key: str) -> np.ndarray:
+
+    def __init__(
+        self,
+        corr_model="gaussian",
+        range_=4.0,
+        sill1=2.0,
+        sill2=1.0,
+        r12=0.5,
+        nugget1=0.0,
+        nugget2=0.0,
+        eps=1e-10,
+        use_collocated_secondary=True,
+    ):
+        self.corr_model = corr_model
+        self.range_ = float(range_)
+        self.sill1 = float(sill1)
+        self.sill2 = float(sill2)
+        self.r12 = float(r12)
+        self.nugget1 = float(nugget1)
+        self.nugget2 = float(nugget2)
+        self.eps = float(eps)
+        self.use_collocated_secondary = bool(use_collocated_secondary)
+
+        self.w1 = None   # weights on primary obs
+        self.w2 = None   # weights on secondary obs
+        self.n1 = None
+        self.n2 = None
+
+    def fit_geometry(self, X1, X2, x0):
         """
-        Calculate variogram value for distance h.
-        
-        Parameters
-        ----------
-        h : np.ndarray
-            Distance array
-        var_key : str
-            Key for variogram model (e.g., 'var0', 'cross_01')
-            
-        Returns
-        -------
-        gamma : np.ndarray
-            Variogram values
+        X1: (n1,D) primary sample coords
+        X2: (n2,D) secondary sample coords (can include x0 if collocated is enabled)
+        x0: (D,) target coord
         """
-        if var_key not in self.variogram_models:
-            raise ValueError(f"Variogram model for '{var_key}' not found")
-        
-        model_type, params = self.variogram_models[var_key]
-        sill = params.get('sill', 1.0)
-        range_ = params.get('range', 10.0)
-        nugget = params.get('nugget', 0.0)
-        
-        if callable(model_type):
-            return model_type(h, **params)
-        
-        if model_type == 'spherical':
-            gamma = np.where(
-                h <= range_,
-                nugget + (sill - nugget) * (1.5 * h / range_ - 0.5 * (h / range_) ** 3),
-                sill
-            )
-        elif model_type == 'exponential':
-            gamma = nugget + (sill - nugget) * (1 - np.exp(-3 * h / range_))
-        elif model_type == 'gaussian':
-            gamma = nugget + (sill - nugget) * (1 - np.exp(-3 * (h / range_) ** 2))
-        elif model_type == 'linear':
-            # Linear model with sill as slope
-            gamma = nugget + sill * h
-        else:
-            raise ValueError(f"Unknown variogram model: {model_type}")
-        
-        return gamma
-    
-    def fit(self, X_list: List[np.ndarray], y_list: List[np.ndarray]) -> 'OrdinaryCokriging':
-        """
-        Fit the Cokriging model with training data.
-        
-        Parameters
-        ----------
-        X_list : list of np.ndarray
-            List of coordinate arrays for each variable.
-            X_list[0] is primary variable, X_list[1:] are secondary variables.
-            Each array has shape (n_samples_i, n_features)
-        y_list : list of np.ndarray
-            List of value arrays for each variable.
-            y_list[0] is primary variable, y_list[1:] are secondary variables.
-            Each array has shape (n_samples_i,)
-            
-        Returns
-        -------
-        self : OrdinaryCokriging
-            Fitted model
-        """
-        if len(X_list) != self.n_variables or len(y_list) != self.n_variables:
-            raise ValueError(f"Expected {self.n_variables} variables, got {len(X_list)}")
-        
-        for i in range(self.n_variables):
-            self.X_train[i] = np.atleast_2d(X_list[i])
-            self.y_train[i] = np.array(y_list[i])
-            self.n_samples[i] = len(y_list[i])
-        
+        X1 = np.asarray(X1, float)
+        X2 = np.asarray(X2, float)
+        x0 = np.asarray(x0, float).reshape(1, -1)
+
+        if X1.ndim == 1:
+            X1 = X1.reshape(-1, 1)
+        if X2.ndim == 1:
+            X2 = X2.reshape(-1, 1)
+
+        n1, D = X1.shape
+        n2, D2 = X2.shape
+        if D2 != D:
+            raise ValueError("X1 and X2 must have same dimensionality")
+
+        if not (-1.0 <= self.r12 <= 1.0):
+            raise ValueError("r12 must be within [-1, 1] for PSD ICM")
+
+        self.n1, self.n2 = n1, n2
+
+        # Distances
+        D11 = cdist(X1, X1)
+        D22 = cdist(X2, X2)
+        D12 = cdist(X1, X2)
+
+        rho11 = _corr(D11, self.corr_model, self.range_)
+        rho22 = _corr(D22, self.corr_model, self.range_)
+        rho12 = _corr(D12, self.corr_model, self.range_)
+
+        # Cov blocks
+        C11 = self.sill1 * rho11
+        C22 = self.sill2 * rho22
+        C12 = (self.r12 * np.sqrt(self.sill1 * self.sill2)) * rho12  # (n1,n2)
+        C21 = C12.T
+
+        # Add nuggets on diagonals
+        if self.nugget1 > 0:
+            C11 = C11.copy()
+            C11[np.diag_indices_from(C11)] += self.nugget1
+        if self.nugget2 > 0:
+            C22 = C22.copy()
+            C22[np.diag_indices_from(C22)] += self.nugget2
+
+        # Big C
+        N = n1 + n2
+        C = np.zeros((N, N), float)
+        C[:n1, :n1] = C11
+        C[:n1, n1:] = C12
+        C[n1:, :n1] = C21
+        C[n1:, n1:] = C22
+
+        # Constraints: one per variable (OKCK)
+        # F = [1 on primary obs, 0 on secondary obs; 0 on primary obs, 1 on secondary obs]
+        F = np.zeros((N, 2), float)
+        F[:n1, 0] = 1.0
+        F[n1:, 1] = 1.0
+        f0 = np.array([1.0, 0.0], float)  # predict primary mean only
+
+        # c vector: cov between all obs and primary at x0
+        d10 = cdist(X1, x0)  # (n1,1)
+        d20 = cdist(X2, x0)  # (n2,1)
+
+        c1 = self.sill1 * _corr(d10, self.corr_model, self.range_).reshape(-1)  # (n1,)
+        c2 = (self.r12 * np.sqrt(self.sill1 * self.sill2)) * _corr(d20, self.corr_model, self.range_).reshape(-1)  # (n2,)
+        c = np.concatenate([c1, c2], axis=0)  # (N,)
+
+        # Solve [C F; F' 0][w;lam]=[c;f0] via Schur on C (SPD)
+        C = C + self.eps * np.eye(N)
+        cf = cho_factor(C, lower=True, check_finite=False)
+
+        CiF = cho_solve(cf, F, check_finite=False)          # (N,2)
+        Cic = cho_solve(cf, c.reshape(-1, 1), check_finite=False).reshape(-1)  # (N,)
+
+        S = F.T @ CiF                                       # (2,2)
+        rhs = F.T @ Cic - f0                                # (2,)
+        S = S + self.eps * np.eye(2)
+        lam = np.linalg.solve(S, rhs)                       # (2,)
+
+        w = Cic - CiF @ lam                                 # (N,)
+        self.w1 = w[:n1].copy()
+        self.w2 = w[n1:].copy()
         return self
-    
-    def _build_cokriging_matrix(self, X_pred: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+
+    def predict_timeseries(self, y1_all, y2_all):
         """
-        Build the cokriging system matrices for prediction.
-        
-        Parameters
-        ----------
-        X_pred : np.ndarray, shape (n_pred, n_features)
-            Coordinates where predictions are needed (for primary variable)
-            
-        Returns
-        -------
-        A : np.ndarray
-            Left-hand side cokriging matrix
-        b : np.ndarray
-            Right-hand side cokriging matrix
+        y1_all: (n1,T) primary values
+        y2_all: (n2,T) secondary values (must match X2 used in fit_geometry)
+        returns: (T,)
         """
-        n_pred = X_pred.shape[0]
-        
-        # Calculate total number of data points and constraints
-        total_samples = sum(self.n_samples.values())
-        matrix_size = total_samples + self.n_variables
-        
-        # Initialize cokriging matrix
-        A = np.zeros((matrix_size, matrix_size))
-        
-        # Build block structure
-        # A = | C   | U |
-        #     | U^T | 0 |
-        # where C contains all auto- and cross-variograms
-        # and U contains the unbiasedness constraints (ones)
-        
-        row_offset = 0
-        col_offset = 0
-        
-        # Fill the covariance blocks
-        for i in range(self.n_variables):
-            for j in range(self.n_variables):
-                n_i = self.n_samples[i]
-                n_j = self.n_samples[j]
-                
-                # Calculate distances
-                dist = cdist(self.X_train[i], self.X_train[j])
-                
-                # Get appropriate variogram
-                if i == j:
-                    var_key = f'var{i}'
-                else:
-                    # Cross-variogram (symmetric)
-                    var_key = f'cross_{min(i,j)}{max(i,j)}'
-                
-                gamma = self._variogram(dist, var_key)
-                
-                # Fill block
-                A[row_offset:row_offset+n_i, col_offset:col_offset+n_j] = gamma
-                
-                col_offset += n_j
-            
-            col_offset = 0
-            row_offset += n_i
-        
-        # Add unbiasedness constraints (ones for each variable)
-        constraint_offset = total_samples
-        sample_offset = 0
-        
-        for i in range(self.n_variables):
-            n_i = self.n_samples[i]
-            A[sample_offset:sample_offset+n_i, constraint_offset+i] = 1
-            A[constraint_offset+i, sample_offset:sample_offset+n_i] = 1
-            sample_offset += n_i
-        
-        # Add small regularization to diagonal for numerical stability
-        eps = 1e-6
-        A[:total_samples, :total_samples] += eps * np.eye(total_samples)
-        
-        # Build right-hand side b for each prediction point
-        b = np.zeros((n_pred, matrix_size))
-        
-        sample_offset = 0
-        for i in range(self.n_variables):
-            n_i = self.n_samples[i]
-            
-            # Distance from prediction points to training points of variable i
-            if i == 0:
-                # Primary variable - use prediction locations
-                dist_pred = cdist(X_pred, self.X_train[i])
-                var_key = 'var0'
-            else:
-                # Secondary variables - use cross-variogram with primary
-                dist_pred = cdist(X_pred, self.X_train[i])
-                var_key = f'cross_0{i}'
-            
-            gamma_pred = self._variogram(dist_pred, var_key)
-            b[:, sample_offset:sample_offset+n_i] = gamma_pred
-            
-            sample_offset += n_i
-        
-        # Unbiasedness constraint for primary variable only
-        b[:, total_samples] = 1
-        
-        return A, b
-    
-    def predict(self, X_pred: np.ndarray, 
-                return_std: bool = False) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-        """
-        Predict primary variable values at new locations using Cokriging.
-        
-        Parameters
-        ----------
-        X_pred : np.ndarray, shape (n_pred, n_features)
-            Coordinates where predictions are needed
-        return_std : bool, default=False
-            Whether to return kriging standard deviation
-            
-        Returns
-        -------
-        y_pred : np.ndarray, shape (n_pred,)
-            Predicted values for primary variable
-        sigma : np.ndarray, shape (n_pred,), optional
-            Kriging standard deviation (if return_std=True)
-        """
-        if not self.X_train:
-            raise ValueError("Model must be fitted before prediction")
-        
-        X_pred = np.atleast_2d(X_pred)
-        
-        # Build cokriging system
-        A, b = self._build_cokriging_matrix(X_pred)
-        
-        # Solve cokriging system for weights
-        weights = _solve_cokriging(A, b)
-        
-        # Calculate predictions using all variables
-        y_pred = np.zeros(X_pred.shape[0])
-        
-        sample_offset = 0
-        for i in range(self.n_variables):
-            n_i = self.n_samples[i]
-            y_pred += weights[:, sample_offset:sample_offset+n_i] @ self.y_train[i]
-            sample_offset += n_i
-        
-        if return_std:
-            # Calculate cokriging variance
-            sigma_squared = np.sum(weights * b, axis=1)
-            sigma = np.sqrt(np.maximum(sigma_squared, 0))  # Ensure non-negative
-            return y_pred, sigma
-        
-        return y_pred, None
+        if self.w1 is None:
+            raise ValueError("Call fit_geometry first")
+
+        y1_all = np.asarray(y1_all, float)
+        y2_all = np.asarray(y2_all, float)
+        if y1_all.shape[0] != self.n1 or y2_all.shape[0] != self.n2:
+            raise ValueError("y shapes must match fitted geometry")
+
+        # yhat[t] = w1@y1[:,t] + w2@y2[:,t]
+        return (self.w1 @ y1_all) + (self.w2 @ y2_all)
 
 
-def _solve_cokriging(A, b):
-    """
-    Solve cokriging system with robust fallbacks.
+def fast_okck_time_series(
+    nxs,            # (K,D) neighbor coords
+    xs,             # (D,)  target coord
+    nby,            # (K,T) neighbor water level
+    nrain,          # (K,T) neighbor rainfall
+    lrain,          # (T,)  target rainfall (optional collocated secondary)
+    *,
+    corr_model="gaussian",
+    range_=4.0,
+    sill1=2.0,
+    sill2=1.0,
+    r12=0.5,
+    nugget1=0.0,
+    nugget2=0.0,
+    eps=1e-10,
+    use_collocated_secondary=True,
+):
+    nxs = np.asarray(nxs, float)
+    xs = np.asarray(xs, float).reshape(-1)
+    nby = np.asarray(nby, float)
+    nrain = np.asarray(nrain, float)
+    lrain = np.asarray(lrain, float).reshape(-1)
 
-    Parameters
-    ----------
-    A : ndarray, shape (M, M)
-        Cokriging matrix
-    b : ndarray, shape (n_pred, M)
-        RHS matrix (one row per prediction point)
+    K, D = nxs.shape
+    T = nby.shape[1]
 
-    Returns
-    -------
-    weights : ndarray, shape (n_pred, M)
-    """
-    B = b.T  # (M, n_pred)
+    # X1 = primary coords (neighbors)
+    X1 = nxs
 
-    try:
-        # 1) Exact solve
-        W = solve(A, B)
-    except np.linalg.LinAlgError:
-        try:
-            # 2) Least squares fallback
-            W = np.linalg.lstsq(A, B, rcond=1e-10)[0]
-        except Exception:
-            # 3) Regularized solve (last resort)
-            eps = 1e-5
-            A_reg = A + eps * np.eye(A.shape[0])
-            W = solve(A_reg, B)
+    # X2 = secondary coords (neighbors + optional collocated at target)
+    if use_collocated_secondary:
+        X2 = np.vstack([nxs, xs.reshape(1, -1)])  # (K+1,D)
+        y2 = np.vstack([nrain, lrain.reshape(1, -1)])  # (K+1,T)
+    else:
+        X2 = nxs
+        y2 = nrain
 
-    return W.T  # (n_pred, M)
+    okck = CachedOKCKIntrinsic(
+        corr_model=corr_model,
+        range_=range_,
+        sill1=sill1,
+        sill2=sill2,
+        r12=r12,
+        nugget1=nugget1,
+        nugget2=nugget2,
+        eps=eps,
+        use_collocated_secondary=use_collocated_secondary,
+    ).fit_geometry(X1=X1, X2=X2, x0=xs)
 
-
-# Example usage and demonstration
-def example_1d():
-    """Simple 1D example with synthetic data"""
-    print("=" * 60)
-    print("Example 1: 1D Ordinary Cokriging")
-    print("=" * 60)
-    
-    # Generate synthetic data
-    np.random.seed(42)
-    
-    # Primary variable (sparse sampling)
-    n_primary = 15
-    X_primary = np.linspace(0, 100, n_primary).reshape(-1, 1)
-    y_primary = (20 * np.sin(X_primary.ravel() / 15) + 
-                 10 * np.cos(X_primary.ravel() / 25) +
-                 np.random.normal(0, 2, n_primary))
-    
-    # Secondary variable (dense sampling, correlated with primary)
-    n_secondary = 40
-    X_secondary = np.linspace(0, 100, n_secondary).reshape(-1, 1)
-    y_secondary = (15 * np.sin(X_secondary.ravel() / 15) + 
-                   8 * np.cos(X_secondary.ravel() / 25) +
-                   5 * np.sin(X_secondary.ravel() / 8) +
-                   np.random.normal(0, 1.5, n_secondary))
-    
-    # Prediction points
-    X_pred = np.linspace(0, 100, 200).reshape(-1, 1)
-    
-    # Define variogram models
-    variogram_models = {
-        'var0': ('spherical', {'sill': 40.0, 'range': 30.0, 'nugget': 2.0}),
-        'var1': ('spherical', {'sill': 30.0, 'range': 25.0, 'nugget': 1.5}),
-        'cross_01': ('spherical', {'sill': 25.0, 'range': 28.0, 'nugget': 1.0})
-    }
-    
-    # Fit Cokriging model
-    cok = OrdinaryCokriging(variogram_models=variogram_models, n_variables=2)
-    cok.fit([X_primary, X_secondary], [y_primary, y_secondary])
-    
-    # Predict
-    y_pred, sigma = cok.predict(X_pred, return_std=True)
-    
-    # Plot results
-    plt.figure(figsize=(14, 5))
-    
-    plt.subplot(1, 2, 1)
-    plt.scatter(X_primary, y_primary, c='red', s=80, label='Primary variable', 
-                zorder=3, edgecolors='darkred', linewidth=1.5)
-    plt.scatter(X_secondary, y_secondary, c='blue', s=30, alpha=0.5, 
-                label='Secondary variable', zorder=2)
-    plt.plot(X_pred, y_pred, 'g-', label='Cokriging prediction', linewidth=2.5)
-    plt.fill_between(X_pred.ravel(), 
-                     y_pred - 2*sigma, 
-                     y_pred + 2*sigma, 
-                     alpha=0.3, color='green', label='±2σ confidence')
-    plt.xlabel('Location', fontsize=11)
-    plt.ylabel('Value', fontsize=11)
-    plt.title('Ordinary Cokriging - 1D Predictions', fontsize=12, fontweight='bold')
-    plt.legend(loc='best')
-    plt.grid(True, alpha=0.3)
-    
-    plt.subplot(1, 2, 2)
-    plt.plot(X_pred, sigma, 'purple', linewidth=2)
-    plt.axhline(y=np.mean(sigma), color='orange', linestyle='--', 
-                label=f'Mean σ = {np.mean(sigma):.2f}')
-    plt.xlabel('Location', fontsize=11)
-    plt.ylabel('Prediction Std Dev (σ)', fontsize=11)
-    plt.title('Prediction Uncertainty', fontsize=12, fontweight='bold')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig('/mnt/user-data/outputs/cokriging_1d_example.png', dpi=150, bbox_inches='tight')
-    print("✓ 1D example plot saved")
-    
-    return cok, y_pred, sigma
-
-
-def example_2d():
-    """2D spatial example with multiple variables"""
-    print("\n" + "=" * 60)
-    print("Example 2: 2D Ordinary Cokriging")
-    print("=" * 60)
-    
-    # Generate 2D synthetic data
-    np.random.seed(42)
-    
-    # Primary variable (sparse sampling - e.g., soil moisture)
-    n_primary = 30
-    X_primary = np.random.uniform(0, 100, (n_primary, 2))
-    y_primary = (20 * np.sin(X_primary[:, 0] / 20) * np.cos(X_primary[:, 1] / 20) +
-                 0.3 * X_primary[:, 0] + 0.2 * X_primary[:, 1] +
-                 np.random.normal(0, 3, n_primary))
-    
-    # Secondary variable (denser sampling - e.g., temperature)
-    n_secondary = 60
-    X_secondary = np.random.uniform(0, 100, (n_secondary, 2))
-    y_secondary = (15 * np.sin(X_secondary[:, 0] / 20) * np.cos(X_secondary[:, 1] / 20) +
-                   0.25 * X_secondary[:, 0] + 0.15 * X_secondary[:, 1] +
-                   8 * np.sin(X_secondary[:, 0] / 15) +
-                   np.random.normal(0, 2, n_secondary))
-    
-    # Create prediction grid
-    x_grid = np.linspace(0, 100, 50)
-    y_grid = np.linspace(0, 100, 50)
-    X_grid, Y_grid = np.meshgrid(x_grid, y_grid)
-    X_pred = np.column_stack([X_grid.ravel(), Y_grid.ravel()])
-    
-    # Define variogram models
-    variogram_models = {
-        'var0': ('exponential', {'sill': 80.0, 'range': 35.0, 'nugget': 4.0}),
-        'var1': ('exponential', {'sill': 60.0, 'range': 30.0, 'nugget': 3.0}),
-        'cross_01': ('exponential', {'sill': 50.0, 'range': 32.0, 'nugget': 2.0})
-    }
-    
-    # Fit Cokriging model
-    cok = OrdinaryCokriging(variogram_models=variogram_models, n_variables=2)
-    cok.fit([X_primary, X_secondary], [y_primary, y_secondary])
-    
-    # Predict
-    y_pred, sigma = cok.predict(X_pred, return_std=True)
-    
-    # Reshape for plotting
-    Z_pred = y_pred.reshape(X_grid.shape)
-    Z_sigma = sigma.reshape(X_grid.shape)
-    
-    # Plot results
-    fig, axes = plt.subplots(1, 3, figsize=(17, 5))
-    
-    # Prediction map
-    im1 = axes[0].contourf(X_grid, Y_grid, Z_pred, levels=20, cmap='viridis')
-    axes[0].scatter(X_primary[:, 0], X_primary[:, 1], c=y_primary, 
-                   s=100, edgecolors='white', linewidth=2, cmap='viridis',
-                   label='Primary var')
-    axes[0].scatter(X_secondary[:, 0], X_secondary[:, 1], c='red', 
-                   s=20, alpha=0.4, marker='^', label='Secondary var')
-    axes[0].set_xlabel('X coordinate', fontsize=11)
-    axes[0].set_ylabel('Y coordinate', fontsize=11)
-    axes[0].set_title('Cokriging Predictions', fontsize=12, fontweight='bold')
-    axes[0].legend(loc='upper right')
-    plt.colorbar(im1, ax=axes[0], label='Predicted value')
-    
-    # Uncertainty map
-    im2 = axes[1].contourf(X_grid, Y_grid, Z_sigma, levels=20, cmap='Reds')
-    axes[1].scatter(X_primary[:, 0], X_primary[:, 1], c='blue', 
-                   s=80, alpha=0.7, edgecolors='white', linewidth=1)
-    axes[1].scatter(X_secondary[:, 0], X_secondary[:, 1], c='green', 
-                   s=20, alpha=0.4, marker='^')
-    axes[1].set_xlabel('X coordinate', fontsize=11)
-    axes[1].set_ylabel('Y coordinate', fontsize=11)
-    axes[1].set_title('Prediction Uncertainty (σ)', fontsize=12, fontweight='bold')
-    plt.colorbar(im2, ax=axes[1], label='Standard deviation')
-    
-    # Sampling density comparison
-    axes[2].scatter(X_primary[:, 0], X_primary[:, 1], c='red', 
-                   s=100, alpha=0.7, label=f'Primary (n={n_primary})', 
-                   edgecolors='darkred', linewidth=1.5)
-    axes[2].scatter(X_secondary[:, 0], X_secondary[:, 1], c='blue', 
-                   s=50, alpha=0.5, label=f'Secondary (n={n_secondary})',
-                   marker='^')
-    axes[2].set_xlabel('X coordinate', fontsize=11)
-    axes[2].set_ylabel('Y coordinate', fontsize=11)
-    axes[2].set_title('Sampling Locations', fontsize=12, fontweight='bold')
-    axes[2].legend(loc='upper right')
-    axes[2].grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig('/mnt/user-data/outputs/cokriging_2d_example.png', dpi=150, bbox_inches='tight')
-    print("✓ 2D example plot saved")
-    
-    return cok, Z_pred, Z_sigma
-
-
-def example_3_variables():
-    """Example with 3 variables (1 primary + 2 secondary)"""
-    print("\n" + "=" * 60)
-    print("Example 3: Cokriging with 3 Variables")
-    print("=" * 60)
-    
-    np.random.seed(42)
-    
-    # Primary variable (very sparse)
-    n_primary = 10
-    X_primary = np.random.uniform(0, 100, (n_primary, 2))
-    y_primary = (25 * np.sin(X_primary[:, 0] / 18) +
-                 0.4 * X_primary[:, 1] +
-                 np.random.normal(0, 3, n_primary))
-    
-    # Secondary variable 1 (moderate sampling)
-    n_sec1 = 30
-    X_sec1 = np.random.uniform(0, 100, (n_sec1, 2))
-    y_sec1 = (20 * np.sin(X_sec1[:, 0] / 18) +
-              0.35 * X_sec1[:, 1] +
-              5 * np.cos(X_sec1[:, 0] / 25) +
-              np.random.normal(0, 2, n_sec1))
-    
-    # Secondary variable 2 (dense sampling)
-    n_sec2 = 50
-    X_sec2 = np.random.uniform(0, 100, (n_sec2, 2))
-    y_sec2 = (18 * np.sin(X_sec2[:, 0] / 18) +
-              0.3 * X_sec2[:, 1] +
-              8 * np.sin(X_sec2[:, 1] / 20) +
-              np.random.normal(0, 2.5, n_sec2))
-    
-    # Prediction grid
-    x_grid = np.linspace(0, 100, 40)
-    y_grid = np.linspace(0, 100, 40)
-    X_grid, Y_grid = np.meshgrid(x_grid, y_grid)
-    X_pred = np.column_stack([X_grid.ravel(), Y_grid.ravel()])
-    
-    # Define variogram models for 3 variables
-    variogram_models = {
-        'var0': ('spherical', {'sill': 70.0, 'range': 40.0, 'nugget': 3.0}),
-        'var1': ('spherical', {'sill': 60.0, 'range': 35.0, 'nugget': 2.5}),
-        'var2': ('spherical', {'sill': 65.0, 'range': 38.0, 'nugget': 3.5}),
-        'cross_01': ('spherical', {'sill': 55.0, 'range': 37.0, 'nugget': 2.0}),
-        'cross_02': ('spherical', {'sill': 50.0, 'range': 36.0, 'nugget': 2.5}),
-        'cross_12': ('spherical', {'sill': 45.0, 'range': 34.0, 'nugget': 2.0})
-    }
-    
-    # Fit Cokriging model with 3 variables
-    cok = OrdinaryCokriging(variogram_models=variogram_models, n_variables=3)
-    cok.fit([X_primary, X_sec1, X_sec2], [y_primary, y_sec1, y_sec2])
-    
-    # Predict
-    y_pred, sigma = cok.predict(X_pred, return_std=True)
-    
-    # Reshape for plotting
-    Z_pred = y_pred.reshape(X_grid.shape)
-    Z_sigma = sigma.reshape(X_grid.shape)
-    
-    # Plot results
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    
-    # Prediction map
-    im1 = axes[0].contourf(X_grid, Y_grid, Z_pred, levels=20, cmap='plasma')
-    axes[0].scatter(X_primary[:, 0], X_primary[:, 1], c='red', 
-                   s=150, edgecolors='white', linewidth=2, 
-                   label=f'Primary (n={n_primary})', marker='o', zorder=5)
-    axes[0].scatter(X_sec1[:, 0], X_sec1[:, 1], c='yellow', 
-                   s=60, alpha=0.6, label=f'Secondary 1 (n={n_sec1})', 
-                   marker='s', edgecolors='orange')
-    axes[0].scatter(X_sec2[:, 0], X_sec2[:, 1], c='cyan', 
-                   s=30, alpha=0.5, label=f'Secondary 2 (n={n_sec2})', 
-                   marker='^')
-    axes[0].set_xlabel('X coordinate', fontsize=11)
-    axes[0].set_ylabel('Y coordinate', fontsize=11)
-    axes[0].set_title('3-Variable Cokriging Predictions', fontsize=12, fontweight='bold')
-    axes[0].legend(loc='upper right', fontsize=9)
-    plt.colorbar(im1, ax=axes[0], label='Predicted value')
-    
-    # Uncertainty map
-    im2 = axes[1].contourf(X_grid, Y_grid, Z_sigma, levels=20, cmap='YlOrRd')
-    axes[1].scatter(X_primary[:, 0], X_primary[:, 1], c='blue', 
-                   s=100, alpha=0.8, edgecolors='darkblue', linewidth=1.5)
-    axes[1].set_xlabel('X coordinate', fontsize=11)
-    axes[1].set_ylabel('Y coordinate', fontsize=11)
-    axes[1].set_title('Prediction Uncertainty', fontsize=12, fontweight='bold')
-    plt.colorbar(im2, ax=axes[1], label='Standard deviation')
-    
-    plt.tight_layout()
-    plt.savefig('/mnt/user-data/outputs/cokriging_3var_example.png', dpi=150, bbox_inches='tight')
-    print("✓ 3-variable example plot saved")
-    
-    # Print statistics
-    print(f"\nPrediction Statistics:")
-    print(f"  Mean prediction: {np.mean(y_pred):.2f}")
-    print(f"  Std of predictions: {np.std(y_pred):.2f}")
-    print(f"  Mean uncertainty (σ): {np.mean(sigma):.2f}")
-    print(f"  Max uncertainty: {np.max(sigma):.2f}")
-    
-    return cok, Z_pred, Z_sigma
-
-
-if __name__ == "__main__":
-    print("\nOrdinary Cokriging - Implementation Demo\n")
-    
-    # Run examples
-    cok_1d, pred_1d, std_1d = example_1d()
-    cok_2d, pred_2d, std_2d = example_2d()
-    cok_3var, pred_3var, std_3var = example_3_variables()
-    
-    print("\n" + "=" * 60)
-    print("All examples completed successfully!")
-    print("Plots saved to outputs directory:")
-    print("  - cokriging_1d_example.png")
-    print("  - cokriging_2d_example.png")
-    print("  - cokriging_3var_example.png")
-    print("=" * 60)
+    yhat = okck.predict_timeseries(y1_all=nby, y2_all=y2)  # (T,)
+    return yhat

@@ -1,12 +1,10 @@
-from scipy.signal import savgol_filter
 import pandas as pd
-import pytz
 import torch
 
 import os
-import csv
 import math
 
+from scipy.signal import savgol_filter
 from collections import defaultdict
 
 import random
@@ -22,7 +20,7 @@ from torch.utils.data import Dataset
 from torch_geometric.data import Data
 
 import matplotlib.pyplot as plt
-from scipy.signal import medfilt
+from statsmodels.nonparametric.smoothers_lowess import lowess
 
 import geohash
 
@@ -172,6 +170,72 @@ def compute_horizontal_vertical_distance(lat1, lon1, lat2, lon2):
 
 def l2_distance(p1, p2):
     return abs(p1[0] - p2[0]) + abs(p1[1] - p2[1])
+
+
+def fluctuation_probability(y, window_frac=0.15, polyorder=2,
+                            local_frac=0.1):
+    """
+    Detect persistent (possibly bursty) fluctuations.
+    """
+
+    y = np.asarray(y)
+    N = len(y)
+
+    if N < polyorder + 5:
+        return 0.0, {"reason": "too short"}
+
+    # -------------------------
+    # 1. Trend
+    # -------------------------
+    window = int(round(window_frac * N))
+    window = max(polyorder + 2, min(window, N))
+    if window % 2 == 0:
+        window -= 1
+
+    trend = savgol_filter(y, window_length=window, polyorder=polyorder)
+    resid = y - trend
+
+    # -------------------------
+    # 2. Amplitude score
+    # -------------------------
+    resid_energy = np.mean(resid ** 2)
+    trend_energy = np.mean(trend ** 2) + 1e-12
+    energy_score = resid_energy / (resid_energy + trend_energy)
+
+    # -------------------------
+    # 3. Local fluctuation coverage (KEY FIX)
+    # -------------------------
+    L = max(5, int(local_frac * N))
+    step = L // 2
+
+    active = []
+    for i in range(0, N - L + 1, step):
+        seg = resid[i:i + L]
+        zcr = np.mean(np.sign(seg[:-1]) != np.sign(seg[1:]))
+        amp = np.std(seg)
+
+        active.append((zcr > 0.1) and (amp > 0.5 * np.std(resid)))
+
+    coverage_score = np.mean(active) if active else 0.0
+
+    # -------------------------
+    # 4. Final probability
+    # -------------------------
+    prob = (
+        0.5 * energy_score +
+        0.5 * coverage_score
+    )
+
+    prob = float(np.clip(prob, 0, 1))
+
+    diagnostics = {
+        "energy_score": energy_score,
+        "coverage_score": coverage_score,
+        "window_length": window,
+        "local_window": L
+    }
+
+    return prob, diagnostics
 
 
 def split_into_weekly_segments(times, values, r1x1, r3x3, r5x5, r7x7, r9x9, global_start):
@@ -452,13 +516,6 @@ class WaterDataset(Dataset):
 
         self.invalid_list = [
             # test
-            # (50.9761639541252, 3.50350061937995),
-            # (50.967587, 3.46339),
-            # (50.963005, 3.505905),
-            # (50.752506, 3.6088760000000004),
-            # (51.148039, 3.864885),      # too few data points
-            # (51.14826076428264, 3.902723574459568),  # too few data points
-            # (51.03393855766628, 3.551301116668707),
             (50.75034473379703, 3.979828442354752),
             (50.751208179845, 3.971109149875746),
             (50.75330774120651, 3.963098792810351),
@@ -471,6 +528,8 @@ class WaterDataset(Dataset):
             (50.87282736801505, 4.056547787684996),
             (50.80790167884659, 3.626698144970669),
             (50.8296965118308, 4.00959912439749),
+            ########## extra
+            (50.75281561, 3.632510695),
             ###
             (50.984913, 4.156368),
             (50.805603, 4.166977),
@@ -499,6 +558,8 @@ class WaterDataset(Dataset):
             new_values = []
             new_week_idx = []
             for i in range(len(data[k]['values'])):
+                if len(data[k]['values'][i]) == 0:
+                    continue
                 mean_shift = abs(data[k]['values'][i] - mean_val)
                 diff = np.mean(mean_shift)
                 if diff < 4 and np.max(np.diff(mean_shift)) < 0.5:
@@ -677,6 +738,8 @@ class WaterDataset(Dataset):
     def get_random_loc(self, idx):
         while True:
             loc_key = self.using_keys[idx]
+            # # TODO:
+            # break
 
             if self.train:
                 if len(self.data[loc_key]['week_idx']) >= self.length:
@@ -748,7 +811,7 @@ class GWaterDataset(WaterDataset):
             
             # print('loc_key: ', loc_key)
             nb, loc_vals, loc_rain, nb_vals, nb_rain = self.get_time_values_from_loc(loc_key)
-            
+
             if nb is None:
                 idx = random.randint(0, len(self) - 1)
                 continue
@@ -805,13 +868,21 @@ class GWaterDataset(WaterDataset):
                     loc_vals = loc_vals - self.data[loc_key]['mean']
 
                 if self.train:
-                    delta = np.max(np.abs(loc_vals)) - np.min(np.abs(loc_vals))
-                    if delta <= 0.3 or delta >= 4:
+                    delta = abs(np.max(loc_vals) - np.min(loc_vals))
+                    
+                    # prob, diagnostics = fluctuation_probability(loc_vals)
+
+                    # print(gap_score, delta)
+                    # TODO:
+                    # if (delta <= 0.6 or delta >= 4):
+                    #     # skip neighbor if unstable sample
+                    #     idx = np.random.randint(0, len(self))  # re-pick idx
+                    #     continue
+                    if (delta <= 0.50 or delta >= 4):
                         # skip neighbor if unstable sample
                         idx = np.random.randint(0, len(self))  # re-pick idx
                         continue
                     # elif 0.3 < delta <= 0.6:
-                    #     # Keep with 50% probability
                     #     if np.random.rand() > 0.5:
                     #         idx = np.random.randint(0, len(self))
                     #         continue

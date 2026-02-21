@@ -2,16 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import numpy as np
-import scipy
 from torch_geometric.utils import softmax
 from torch_geometric.nn.conv import MessagePassing
 
-from sklearn.neighbors import NearestNeighbors
 from model.common import Mlp
 from model.gru import minGRU
-
-from typing import Callable, Optional, Tuple
+from model.neural_kriging import LatentKriging1Target
 
 
 class fullGRU(nn.Module):
@@ -25,76 +21,11 @@ class fullGRU(nn.Module):
         return out
 
 
-def time_varying_conv1d(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """
-    Causal time-varying FIR.
-    x: [B, T, C]  (signal)
-    w: [B, T, K]  (kernel at each time step; shared across channels)
-    returns y: [B, T, C]  (same length)
-    """
-    B, T, C = x.shape
-    Bw, Tw, K = w.shape
-    assert B == Bw and T == Tw, "Batch/time dims must match"
-
-    # causal same-length: pad K-1 on the left so each t uses x[t-K+1 ... t]
-    x_pad = F.pad(x.permute(0, 2, 1), (K-1, 0))      # [B, C, T+K-1]
-    # make sliding windows of length K along time
-    x_win = x_pad.unfold(dimension=-1, size=K, step=1)  # [B, C, T, K]
-
-    # w is [B, T, K] -> broadcast over channels: [B, 1, T, K]
-    w_exp = w.unsqueeze(1)                               # [B, 1, T, K]
-
-    # dot product over the K dimension -> [B, C, T]
-    y = (x_win * w_exp).sum(dim=-1)                      # [B, C, T]
-    return y.permute(0, 2, 1)                            # [B, T, C]
-
-
-class HyperFIR(nn.Module):
-    """
-    Generate a per-sample FIR kernel from static features z,
-    then convolve with x_main.
-    """
-    def __init__(self):
-        super().__init__()
-
-        self.k_len = 9
-        self.pos_enc = minGRU(8, expansion_factor=2)
-        self.mlp = nn.Sequential(
-            nn.Linear(10, 8),
-            nn.GELU(),
-            nn.Linear(8, 8),
-        )
-
-        self.kernel = nn.Sequential(
-            minGRU(8, expansion_factor=2),
-            nn.GELU(),
-            nn.Linear(8, self.k_len),
-        )
-
-    def forward(self, x_main: torch.Tensor, zi: torch.Tensor, zj: torch.Tensor):
-        """
-        x_main: [B,8,T], z: [B,S]
-        returns: y_lin [B,1,T]
-        """
-        x_main = x_main.view(x_main.shape[0], -1, 8)  # [B,1,T]
-
-        feats = self.mlp(torch.cat([zi[:, -5:], zj[:, -5:]], dim=-1))                   # [B,8]
-        pos = self.pos_enc(x_main)                    # [B, K]
-
-        feats = feats.unsqueeze(1) + pos                           # [B, K]
-
-        w = self.kernel(feats)           # [B, 1, K]
-        w = F.normalize(w, dim=-1)
-        # w = w / (w.abs().sum(dim=-1, keepdim=True) + 1e-6)
-
-        y = time_varying_conv1d(x_main, w)
-        return y
-
-
 class EdgeAttrGNNLayer(MessagePassing):
-    def __init__(self, in_channels, edge_dim, out_channels=8):
+    def __init__(self, case, edge_dim, out_channels=8):
         super().__init__(aggr='add')  # or 'mean', 'max'
 
+        self.case = case
         self.lin_edge = nn.Sequential(
             torch.nn.Linear(edge_dim, 16),
             torch.nn.GELU(),
@@ -110,15 +41,26 @@ class EdgeAttrGNNLayer(MessagePassing):
         
         self.node_update = nn.Identity()   # drop-in point for per-node MLP if you want
         if out_channels != -1:
-            self.post_update = nn.Sequential(
-                # minGRU(out_channels, expansion_factor=2),
-                # nn.Linear(8, 8), 
-                fullGRU(8, 8, batch_first=True),
-                torch.nn.GELU(),
-                nn.Linear(8, 1),
-            )
+            if self.case != "mlp":
+                self.post_update = nn.Sequential(
+                    # fullGRU(8, 8, batch_first=True),
+                    # torch.nn.Tanh(),
+                    minGRU(8),
+                    nn.Linear(8, 1),
+                )
+            else:
+                self.post_update = nn.Sequential(
+                    nn.Linear(8, 8),
+                    torch.nn.GELU(),
+                    nn.Linear(8, 1),
+                )
         else:
             self.post_update = nn.Identity()
+
+    def freeze(self):
+        self.post_update.eval()
+        for param in self.post_update.parameters():
+            param.requires_grad_ = False
 
     @torch.no_grad()
     def _hops_to_target0(self, edge_index, num_nodes):
@@ -188,15 +130,6 @@ class EdgeAttrGNNLayer(MessagePassing):
         return self.post_update(x_out).squeeze(-1)  # [N, 8] -> [N, 1]
         # return x_out.squeeze(-1)  # [N, 8] -> [N, 1]
 
-    def forward_legacy(self, x, edge_index, edge_attr, valid):
-        # x: [num_nodes, in_channels]
-        # edge_index: [2, num_edges]
-        # edge_attr: [num_edges, edge_dim]
-        # x = self.lin_node(x)
-        edge_attr = self.lin_edge(edge_attr)
-        
-        return self.propagate(edge_index, x=x, edge_weight=edge_attr, valid=valid.squeeze(-1))
-
     def message(self, x_j: torch.Tensor, edge_weight: torch.Tensor, index: torch.Tensor, valid_j: torch.Tensor, pos_feats_i: torch.Tensor, pos_feats_j: torch.Tensor) -> torch.Tensor:
         """
         x_j:         [E_h, C]   source features for this level
@@ -211,48 +144,6 @@ class EdgeAttrGNNLayer(MessagePassing):
         return aggr_out  # self.lin_update(aggr_out)
 
 
-class GATWithEdgeAttr(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels, heads=1):
-        super(GATWithEdgeAttr, self).__init__()
-        hidden_channels = 48
-        edge_dim = 16
-        self.hidden_channels = hidden_channels
-        self.gat = EdgeAttrGNNLayer(hidden_channels, edge_dim=edge_dim, out_channels=-1)
-
-    def forward(self, nodes, edge_index, edge_attr, valid, r, fx):
-        with torch.no_grad():
-            valid = valid.squeeze(0).unsqueeze(-1)
-            nodes = nodes * valid
-
-            N, L, C = nodes.shape
-            nodes = nodes.view(N, -1)
-
-        pred = self.gat(nodes.unsqueeze(-1), edge_index, edge_attr, valid)
-
-        return pred[:1]
-
-
-class GATWithEdgeAttr(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels, heads=1):
-        super(GATWithEdgeAttr, self).__init__()
-        hidden_channels = 48
-        edge_dim = 16
-        self.hidden_channels = hidden_channels
-        self.gat = EdgeAttrGNNLayer(hidden_channels, edge_dim=edge_dim, out_channels=-1)
-
-    def forward(self, nodes, edge_index, edge_attr, valid, r, fx):
-        with torch.no_grad():
-            valid = valid.squeeze(0).unsqueeze(-1)
-            nodes = nodes * valid
-
-            N, L, C = nodes.shape
-            nodes = nodes.view(N, -1)
-
-        pred = self.gat(nodes.unsqueeze(-1), edge_index, edge_attr, valid)
-
-        return pred[:1]
-    
-
 class RainModel(torch.nn.Module):
     def __init__(self):
         super(RainModel, self).__init__()
@@ -262,32 +153,34 @@ class RainModel(torch.nn.Module):
             nn.GELU(),
             nn.Linear(8, 8),
         )
-        # self.rain_mlp = nn.Sequential(
-        #     nn.Linear(1, 8),
-        #     nn.GELU(),
-        #     minGRU(8),
-        # )
-        # self.rain_mlp = nn.Sequential(
-        #     nn.Linear(1, 8),
-        #     nn.GELU(),
-        #     nn.GRU(8, 8, batch_first=True)
-        # )
-
-        self.rain_pos_enc = nn.Sequential(
-            nn.Linear(2, 8),
-            nn.GELU(),
-            nn.Linear(8, 8),
-        )
 
     def forward(self, r, pos):
         # r: [N, L, 1]
         # pos: [N, L, 2]
         r = self.rain_mlp(r.squeeze(0).unsqueeze(-1)).squeeze(-1)
-        # r = self.rain_mlp(r.squeeze(0).unsqueeze(-1))[0].contiguous()
-        # pos_enc = self.rain_pos_enc(pos[:, :, -2:].squeeze(0)).unsqueeze(1).squeeze(-1)
-        # r = r * pos_enc
         return r
     
+
+def centered_cosine(a, b, eps=1e-8):
+    # a,b: (K, D)
+    a = a - a.mean(dim=-1, keepdim=True)
+    b = b - b.mean(dim=-1, keepdim=True)
+    return (a*b).sum(-1) / (a.norm(dim=-1)*b.norm(dim=-1) + eps)  # (K,)
+
+
+def consensus_score(series, eps=1e-8):
+    """
+    series: (K,T)
+    returns cons: (K,1) in [0,1] approximately
+    """
+    K, T = series.shape
+    z = series - series.mean(dim=1, keepdim=True)
+    z = z / (series.std(dim=1, keepdim=True) + eps)
+    C = (z @ z.t()) / T                 # approx corr matrix (K,K)
+    cons = C.abs().mean(dim=1, keepdim=True)  # (K,1)
+    cons = (cons - cons.min()) / (cons.max() - cons.min() + eps)
+    return cons
+
 
 class MLPW(nn.Module):
     def __init__(self, in_dim, n_layers, n_dim):
@@ -317,40 +210,78 @@ class MLPW(nn.Module):
         self.weight = nn.Linear(in_features=n_dim, out_features=1)
         self.out = nn.Linear(in_features=n_dim, out_features=1)
 
-    def forward(self, xs, x):
+    def forward(self, xs, x, return_alpha=False):
         feats = self.dist(xs)
         weights = self.weight(feats)
         weights = torch.relu(weights)
+        # alpha = sparsemax(weights, dim=0)      # (K,1), nonneg, sums to 1
         alpha = weights / (torch.sum(weights, dim=0, keepdim=True) + 1e-8)
-        return torch.sum(x * alpha, dim=0, keepdim=True)
-    
+        
+        out = torch.sum(x * alpha, dim=0, keepdim=True)
 
-def forward_distance(xs, x):
-    """
-    xs: Feature vectors of neighboring stations - batch x stations x channels
-    x: Time series of neighboring stations - batch x stations x time series (168)
-    lrain: Time series of rainfall of the target station  - batch x time series (168)
-    nrain: Time series of rainfall of the neighboring stations  - batch x stations x time series (168)
-    valid: Valid mask - batch x stations x time series (168)
-    """
+        if return_alpha:
+            return out, alpha
+        
+        return out
 
-    xs[:, :1][xs[:, :1] < 0] = 9999
-    weights = 1 / (torch.abs(xs[:, :1]) )
-    alpha = weights / (torch.sum(weights, dim=0, keepdim=True) + 1e-8)
-    return torch.sum(x * alpha, dim=0, keepdim=True)
+class StationLevelGate(nn.Module):
+    def __init__(self, mlpw: MLPW, init_theta=0.2, init_s=10.0):
+        super().__init__()
+        self.mlpw = mlpw
+        self.theta = nn.Parameter(torch.tensor(init_theta))
+        self.log_s = nn.Parameter(torch.log(torch.tensor(init_s)))
+
+    def forward(self, xs, raw_nb, pred_nb, pred0):
+        """
+        xs:     (K, F)  e.g. earray[:K, :3]
+        raw_nb: (K, D)  neighbor observed water level (flattened)
+        pred_nb:(K, D)  rainfall-based prediction at neighbors
+        pred0:  (1, D)  rainfall-based prediction at virtual
+        """
+        # weights from distance features only (your original idea)
+        _, alpha = self.mlpw(xs, raw_nb, return_alpha=True)  # alpha: (K,1)
+
+        # residual at neighbors
+        res_nb = raw_nb - pred_nb  # (K,D)
+
+        # per-station "rain works here" score
+        rho = centered_cosine(pred_nb, raw_nb)  # (K,)
+
+        s = F.softplus(self.log_s) + 1e-6
+        g = torch.sigmoid(s * (rho - self.theta))  # (K,) in [0,1]
+
+        # two absolute candidates per station
+        v_res = pred0 + res_nb                 # (K,D) via broadcast of pred0
+        v_dir = raw_nb                         # (K,D)
+
+        # station-level gate
+        v = g[:, None] * v_res + (1.0 - g)[:, None] * v_dir  # (K,D)
+
+        # final weighted average
+        y0 = torch.sum(v * alpha, dim=0, keepdim=True)  # (1,D)
+
+        return y0, alpha, g, rho
 
 
 class GATWithEdgeAttrRain(torch.nn.Module):
     def __init__(self, hidden_channels=48, edge_dim = 12):
         super(GATWithEdgeAttrRain, self).__init__()
 
+        # full, idw, mlp, only, kriging, split
+        self.case = "mlp"
+
         edge_dim = 3
         self.hidden_channels = hidden_channels
-        self.gat = EdgeAttrGNNLayer(hidden_channels, edge_dim=edge_dim, out_channels=8)
+        self.gat = EdgeAttrGNNLayer(self.case, edge_dim=edge_dim, out_channels=8)
 
-        self.residual_mlp = MLPW(12, 2, 8)
-        self.residual_gat = EdgeAttrGNNLayer(hidden_channels, edge_dim=edge_dim, out_channels=-1)
+        self.residual_mlp = MLPW(12, 1, 8)
         self.rain_mlp = RainModel()
+
+        if self.case == "kriging":
+            self.neural_kriging = LatentKriging1Target(12, 2, 8)
+
+        if self.case == 'split':
+            self.station_gate = StationLevelGate(self.residual_mlp)
 
         self.theta = torch.nn.Parameter(torch.Tensor([0.1, 0.1, 0.1]))
 
@@ -369,35 +300,62 @@ class GATWithEdgeAttrRain(torch.nn.Module):
 
         res_idx = earray.shape[0] # self.find_n_neighbors(r, rf)
 
-        # pred = pred_coarse.squeeze(
-        # -1)
-        # edge_attr = edge_attr[:, :19]
-        edge_attr = edge_attr[:, :3]
-        # edge_attr = torch.cat([edge_attr[:, :3], edge_attr[:, 9:19]], dim=1)
-        # edge_attr = torch.cat([edge_attr[:, :9], edge_attr[:, 17:19]], dim=1)
-        pred = self.gat(rf, edge_index, edge_attr, valid, fx[0])
-        residual = nodes - pred
-        residual[:, 0] = 0
-        
-        # pred_residual = self.residual_gat(
-        #     residual.unsqueeze(-1), edge_index, edge_attr, valid, fx[0]
-        # )
-        pred_residual = self.residual_mlp(
-            earray[:res_idx][:, :19], residual[1:res_idx+1],
-        )
-        # pred_residual = forward_distance(
-        #     earray[:res_idx], residual[1:res_idx+1]
-        # )
+        if self.case == 'split':
+            edge_attr = edge_attr[:, :3]
+            pred = self.gat(rf, edge_index, edge_attr, valid, fx[0])
 
-        adjusted_nodes = pred[:1] + pred_residual
-        
-        valid = valid.squeeze(-1)
-        original_valid = valid.clone()
+            K = res_idx
+            xs = earray[:K]          # (K,3) distance/displacement
+            raw_nb = nodes[1:K+1]        # (K,D)
+            pred_nb = pred[1:K+1]        # (K,D)
+            pred0 = pred[:1]             # (1,D)
 
-        return (
-            adjusted_nodes, pred[:res_idx],
-            pred_coarse[:res_idx], original_valid
-        )
+            adjusted_nodes, alpha, g, rho = self.station_gate(xs, raw_nb, pred_nb, pred0)
+
+            valid = valid.squeeze(-1)
+            original_valid = valid.clone()
+            return (
+                adjusted_nodes, pred[:res_idx],
+                pred_coarse[:res_idx], original_valid
+            )
+        elif self.case != 'only':
+            edge_attr = edge_attr[:, :3]
+            pred = self.gat(rf, edge_index, edge_attr, valid, fx[0])
+
+            K = res_idx
+            raw_nb = nodes[1:K+1]       # (K,T)
+            pred_nb = pred[1:K+1]       # (K,T)
+            pred0   = pred[:1]
+            res_nb  = raw_nb - pred_nb  # (K,T)
+
+            xs = earray[:res_idx]
+
+            if self.case in ["full", "mlp"]:
+                pred_residual = self.residual_mlp(
+                    xs, res_nb
+                )  # pred_residual: (1,T), alpha: (K,1)
+                adjusted_nodes = pred[:1] + pred_residual
+            elif self.case == "idw":
+                pred_residual = forward_distance(
+                    xs, res_nb
+                )
+                adjusted_nodes = pred[:1] + pred_residual
+            elif self.case == 'kriging':
+                pred_residual = self.neural_kriging(
+                    xs, res_nb
+                )
+                adjusted_nodes = pred[:1] + pred_residual
+
+            valid = valid.squeeze(-1)
+            original_valid = valid.clone()
+            return (
+                adjusted_nodes, pred[:res_idx],
+                pred_coarse[:res_idx], original_valid
+            )
+        else:
+            valid = valid.squeeze(-1)
+            original_valid = valid.clone()
+            return pred_coarse[:1].squeeze(-1), pred_coarse[:res_idx].squeeze(-1), pred_coarse[:res_idx], original_valid
 
     def find_n_neighbors(self, r, rf):
         res_idx = rf.shape[0]
@@ -406,38 +364,35 @@ class GATWithEdgeAttrRain(torch.nn.Module):
                 res_idx = i
                 break
         return res_idx
+    
+
+def sparsemax(logits, dim=0):
+    # logits: (K,1) or (K,)
+    z = logits.squeeze(-1)
+    z = z - z.max(dim=dim, keepdim=True).values
+    z_sorted, _ = torch.sort(z, descending=True)
+    k = torch.arange(1, z.numel()+1, device=z.device, dtype=z.dtype)
+    z_cumsum = torch.cumsum(z_sorted, dim=0)
+    
+    # find k(z)
+    cond = 1 + k * z_sorted > z_cumsum
+    k_z = torch.max(k[cond]).long()
+    tau = (z_cumsum[k_z-1] - 1) / k_z
+    p = torch.clamp(z - tau, min=0)
+    
+    return p.unsqueeze(-1)
 
 
-def distance(coord1: torch.Tensor,
-             coord2: torch.Tensor
-             ) -> torch.Tensor:
-    """Distance matrix between two sets of points
-
-    Calculate the pairwise distance between two sets of locations.
-
-    Parameters:
-        coord1:
-            The nxd coordinates array for the first set.
-        coord12:
-            The nxd coordinates array for the second set.
-
-    Returns:
-        dist:
-            The distance matrix.
+def forward_distance(xs, x):
     """
-    if coord1.ndim == 1:
-        m = 1
-        coord1 = coord1.unsqueeze(0)
-    else:
-        m = coord1.shape[0]
-    if coord2.ndim == 1:
-        n = 1
-        coord2 = coord2.unsqueeze(0)
-    else:
-        n = coord2.shape[0]
+    xs: Feature vectors of neighboring stations - batch x stations x channels
+    x: Time series of neighboring stations - batch x stations x time series (168)
+    lrain: Time series of rainfall of the target station  - batch x time series (168)
+    nrain: Time series of rainfall of the neighboring stations  - batch x stations x time series (168)
+    valid: Valid mask - batch x stations x time series (168)
+    """
 
-    #### Can improve (resolved)
-    coord1 = coord1.unsqueeze(0)
-    coord2 = coord2.unsqueeze(1)
-    dists = torch.sqrt(torch.sum((coord1 - coord2) ** 2, axis=-1))
-    return dists
+    xs[:, :1][xs[:, :1] < 0] = 9999
+    weights = 1 / (torch.abs(xs[:, :1]) )
+    alpha = weights / (torch.sum(weights, dim=0, keepdim=True) + 1e-8)
+    return torch.sum(x * alpha, dim=0, keepdim=True)

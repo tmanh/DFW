@@ -9,8 +9,10 @@ import torch.optim as optim
 
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.signal import medfilt
 
-from common.utils import instantiate_from_config
+from scipy.optimize import minimize
+
 from model.mlp import *
 from sklearn.cluster import KMeans
 
@@ -18,9 +20,8 @@ from dataloader import *
 from torch.utils.data import DataLoader
 
 from omegaconf import OmegaConf
-from tqdm import tqdm
 from torchmetrics.functional import pearson_corrcoef
-from scipy.signal import medfilt
+
 
 
 logging.basicConfig(filename="log-test-all.txt", level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -28,11 +29,9 @@ logging.basicConfig(filename="log-test-all.txt", level=logging.INFO, format="%(a
 
 def plot_graph(o, y, x, idx):
     # Move tensors to CPU and convert to NumPy
-    o_np = o.detach().cpu().numpy().flatten()
-    y_np = y.detach().cpu().numpy().flatten()
-    if len(x.shape) == 3:
-        x = x.squeeze(0)
-    x_np = x.detach().cpu().numpy()
+    o_np = o
+    y_np = y
+    x_np = x
 
     # Create a time axis
     time_steps = range(len(y_np))
@@ -40,8 +39,8 @@ def plot_graph(o, y, x, idx):
     # Create and save plot
     plt.figure(figsize=(12, 6))
     plt.plot(time_steps, y_np, label='Ground Truth (y)', marker='o')
-    for i in range(x_np.shape[0]):
-        plt.plot(time_steps, x_np[i], label=f'Source ({i})', marker='o')
+    for i in range(x_np.shape[1]):
+        plt.plot(time_steps, x_np[:, i], label=f'Source ({i})', marker='o')
     plt.plot(time_steps, o_np, label='Interpolated (o)', marker='x')
     plt.title('Comparison of Ground Truth and Interpolated Time Series')
     plt.xlabel('Time Step')
@@ -51,7 +50,7 @@ def plot_graph(o, y, x, idx):
     plt.tight_layout()
 
     # Save to file (you can change path/filename as needed)
-    output_path = f'results/{idx}.png'
+    output_path = f'results/{idx}_nngp.png'
     plt.savefig(output_path)
     plt.close()
 
@@ -78,7 +77,7 @@ def get_checkpoint_name(cfg):
     return f'model_{mn}.pth'
 
 
-def split_stations_by_clusters(data, n_clusters=25, n_train_clusters=7, random_seed=42):
+def split_stations_by_clusters(data, n_clusters=25, n_train_clusters=13, random_seed=42):
     """
     Splits coordinate-based station data into train and test sets using spatial clustering.
 
@@ -207,9 +206,86 @@ def has_significant_slope(ts, window_size=7, range_thresh=0.2, outlier_threshold
     return False  # No significant local change found
 
 
+def oracle_best_interp_weights(
+    y: np.ndarray,          # (T,)
+    nby: np.ndarray,        # (K,T) or (T,K)
+    ridge: float = 1e-8,
+    max_iter: int = 500,
+) -> np.ndarray:
+    y = np.asarray(y, float).reshape(-1)
+
+    N = np.asarray(nby, float)
+    if N.ndim == 3:
+        N = N.squeeze(-1)
+    if N.shape[0] != y.shape[0] and N.shape[1] == y.shape[0]:
+        N = N.T
+    if N.shape[0] != y.shape[0]:
+        raise ValueError(f"nby shape {N.shape} not compatible with y shape {y.shape}")
+
+    T, K = N.shape
+    if K == 0:
+        return np.zeros((0,), float)
+
+    # Precompute quadratic form: ||y - Nw||^2 + ridge||w||^2
+    A = N.T @ N + ridge * np.eye(K)     # (K,K) PSD
+    b = N.T @ y                         # (K,)
+
+    def fun(w):
+        # 0.5 * w^T A w - b^T w + const
+        return 0.5 * (w @ (A @ w)) - (b @ w)
+
+    def jac(w):
+        return (A @ w) - b
+
+    # simplex constraints: w>=0 and sum(w)=1
+    cons = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0,
+             'jac': lambda w: np.ones_like(w)})
+    bounds = [(0.0, 1.0) for _ in range(K)]
+
+    w0 = np.full(K, 1.0 / K, dtype=float)
+
+    res = minimize(fun, w0, method='SLSQP', jac=jac,
+                   bounds=bounds, constraints=cons,
+                   options={'maxiter': max_iter, 'ftol': 1e-12, 'disp': False})
+
+    w = res.x
+    # numerical cleanup
+    w[w < 0] = 0.0
+    s = w.sum()
+    if s > 1e-12:
+        w /= s
+    else:
+        w = np.full(K, 1.0 / K, dtype=float)
+    return w
+
+
+def oracle_best_interp_predict(
+    y: np.ndarray,          # (T,)
+    nby: np.ndarray,        # (K,T) or (T,K)
+    ridge: float = 1e-8,
+    sum_to_one: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Returns:
+      o: (T,) oracle best interpolated series
+      w: (K,) constant weights
+    """
+    y = np.asarray(y, float).reshape(-1)
+    N = np.asarray(nby, float)
+
+    if N.ndim == 3:
+        N = N.squeeze(-1)
+    if N.shape[0] != y.shape[0] and N.shape[1] == y.shape[0]:
+        N = N.T
+    # now N is (T,K)
+    w = oracle_best_interp_weights(y, N, ridge=ridge)
+    o = N @ w
+    return o, w
+
+
 def test(cfg, train=True):
     if not os.path.exists('data/split.pkl'):
-        with open('data/selected_stats_segment.pkl', 'rb') as f:
+        with open('data/selected_stats_rainfall_segment.pkl', 'rb') as f:
             data = pickle.load(f)
 
         good_nb_extended, test_nb = split_stations_by_clusters(data)
@@ -226,64 +302,10 @@ def test(cfg, train=True):
             good_nb_extended = split['train']
             test_nb = split['test']
 
-    # 🔹 1️⃣ Define Device (Multi-GPU)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = 'cpu'
-
-    train_dataset = WaterDataset(
-        path='data/selected_stats_rainfall_segment.pkl', train=True,
-        selected_stations=good_nb_extended, input_type=cfg.dataset.inputs
-    )
-    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
-
-    # 🔹 2️⃣ Initialize Model
-    model = instantiate_from_config(cfg.model).to(device)
-    model = model.to(device)
-
-    mse_loss = nn.MSELoss()
-
     # Training loop
-    num_epochs = 25
-
-    ckpt_name = get_checkpoint_name(cfg=cfg)
-    if train:
-        list_loss = []
-        epoch_bar = tqdm(range(num_epochs), desc="Epochs")  # Initialize tqdm for epochs
-        optimizer = optim.Adam(model.parameters(), lr=0.001)
-        for epoch in epoch_bar:
-            for x, xs, y, kes, lrain, nrain, valid, loc in tqdm(train_loader, desc=f"Training Epoch {epoch+1}", leave=False):
-                x = x.to(device)
-                xs = xs.to(device)
-                y = y.to(device)
-                kes = kes.to(device)
-                valid = valid.to(device)
-                lrain = lrain.to(device)
-                nrain = nrain.to(device)
-
-                # Forward pass
-                o = model(xs, x, lrain, nrain, valid)
-
-                # Compute L1 loss on all elements
-                loss = mse_loss(o, y)
-
-                # Backward pass
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                    
-                # Print loss for every epoch
-                epoch_bar.set_description(f"Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}")
-                list_loss.append(loss.item())
-
-            # Save model checkpoint every 5 epochs
-            torch.save(model.state_dict(), ckpt_name)
-        
-    if ckpt_name is not None:
-        model.load_state_dict(torch.load(ckpt_name), strict=False)
-        model.eval()
-
-    rn = cfg.model['target']
-    test_dataset = WaterDataset(
+    ckpt_name = 'model.best.possible.pkl'
+    
+    test_dataset = WaterDatasetY(
         path='data/selected_stats_rainfall_segment.pkl', train=False,
         selected_stations=test_nb, input_type=cfg.dataset.inputs
     )
@@ -294,7 +316,7 @@ def test(cfg, train=True):
             'loss': [],
             'gain': [],
             'tgts': [],
-            'outs': [],
+            'outs': []
         } for k in range(len(list(test_dataset.data.keys())))
     }
 
@@ -302,71 +324,76 @@ def test(cfg, train=True):
     total_elapsed = 0
     total_n = 0
     with torch.no_grad():
-        for idx, (mx, mxs, my, _, mlrain, mnrain, mvalid, loc) in enumerate(test_loader):
-            start = time.time()
+        for idx, (mxs, my, mlrain, mnbxs, mnby, mnrain, loc) in enumerate(test_loader):
             outs = []
             tgts = []
             cors = []
             gain = []
-            for i in range(mx.shape[2] // seg_len):
-                start = time.time()
-                x = mx[:, :, i*seg_len:(i+1)*seg_len].to(device)
-                valid = mvalid[:, :, i*seg_len:(i+1)*seg_len].to(device)
-                xs = mxs.to(device)
-                y = my[:, i*seg_len:(i+1)*seg_len].to(device)
+            for i in range(my.shape[-1] // seg_len):
+                start_time = time.time()
+                y = my[:, i*seg_len:(i+1)*seg_len].detach().cpu().numpy()
+                nby = mnby[:, :, i*seg_len:(i+1)*seg_len].detach().cpu().numpy()
+                nxs = mnbxs.detach().cpu().numpy()
+                xs = mxs.detach().cpu().numpy()
+                lrain = mlrain[:, i*seg_len:(i+1)*seg_len].detach().cpu().numpy()
+                nrain = mnrain[:, :, i*seg_len:(i+1)*seg_len].detach().cpu().numpy()
+                
+                y = np.expand_dims(y[0], axis=-1)
+                xs = xs.repeat(y.shape[0], axis=0)
+                lrain = np.expand_dims(lrain[0], axis=-1)
+                all_xs = np.concatenate([xs, lrain], axis=-1)
 
-                lrain = mlrain[:, i*seg_len:(i+1)*seg_len].to(device)
-                nrain = mnrain[:, :, i*seg_len:(i+1)*seg_len].to(device)
-
-                loc_vals = y[0].detach().cpu().numpy()
+                loc_vals = y[:, 0]
                 if not has_significant_slope(loc_vals):
                     continue
                 delta = abs(np.max(loc_vals) - np.min(loc_vals))
                 if delta <= 0.3:
                     continue
 
-                o = model(xs, x, lrain, nrain, valid)
+                nby = np.expand_dims(nby[0], axis=-1).transpose(1, 0, 2)
+                nxs = nxs.repeat(y.shape[0], axis=0)
+                nrain = np.expand_dims(nrain[0], -1).transpose(1, 0, 2)
+                all_nxs = np.concatenate([nxs, nrain], axis=-1)
 
-                elapsed = time.time() - start
-                total_elapsed += elapsed
+                # y: (T,1) currently
+                y_vec = y[:, 0]  # (T,)
+
+                # nby currently after your transform is something like (T,K,1) or (K,T,1)
+                N = nby  # keep name aligned
+                o, w = oracle_best_interp_predict(
+                    y=y_vec,
+                    nby=N,
+                    ridge=1e-6,       # small stabilizer
+                    sum_to_one=True,  # interpolation constraint
+                )
+                print(w)
+                rnb = np.squeeze(nrain, axis=-1).transpose(1, 0)
+                rvt = np.transpose(lrain, (1, 0))
+                print(pearson_corrcoef(rnb, rvt))
+                total_elapsed += time.time() - start_time
                 total_n += 1
 
-                # print(o.shape, x.shape, y.shape)
-                # print(o.shape, x.shape)
-                # exit()
-                # from calflops import calculate_flops
-                # inputs = {}
-                # inputs["xs"] = xs
-                # inputs["x"] = x
-                # # inputs["inputs"] = cfg.dataset.inputs
-                # # inputs["train"] = False
-                # # inputs["stage"] = -1
-                # flops, macs, params = calculate_flops(
-                #     model=model, 
-                #     kwargs=inputs,
-                #     output_as_string=True,
-                #     output_precision=4
-                # )
-                # print("FLOPs:%s  MACs:%s  Params:%s \n" %(flops, macs, params))
-                # # FLOPs:31.872 KFLOPS  MACs:15.744 KMACs  Params:5.442 K 
-                # exit()
-                # o1 = idw(xs, x, inputs=cfg.dataset.inputs, train=False, stage=-1)
-
-                o_np = o.flatten().detach().cpu().numpy()
-                y_np = y.flatten().detach().cpu().numpy()
+                o = o.flatten()
+                y = y.flatten()
 
                 outs.extend(
-                    o_np
+                    o
                 )
                 tgts.extend(
-                    y_np
+                    y
+                )
+                cors.append(
+                    pearson_corrcoef(
+                        o,
+                        y
+                    )
                 )
                 gain.extend(
-                    (y_np - o_np).tolist()
+                    (y - o).tolist()
                 )
 
-                if torch.abs(y).max() > 0.5 and torch.abs(y).max() < 1.0:
-                    plot_graph(o, y, x, f'{loc.numpy()}-{idx}-{i}_{rn}')
+                if np.abs(y).max() > 0.5 and np.abs(y).max() < 1.0:
+                    plot_graph(o, y, nby, f'{loc.numpy()}-{idx}-{i}')
 
             outs = np.array(outs)
             tgts = np.array(tgts)
@@ -376,19 +403,15 @@ def test(cfg, train=True):
                     outs,
                     tgts
                 )
-
                 results[idx]['corr'].append(cor)
                 results[idx]['loss'].append(se)
                 results[idx]['gain'].append(gain)
                 results[idx]['tgts'].append(tgts)
                 results[idx]['outs'].append(outs)
-                results[idx]['loc'] = loc.detach().cpu().numpy()
 
-    for k in results.keys():
-        print(f"Key: {k} - {results[k]['loc'] if 'loc' in results[k] else 'No Location'}, Output: {results[k]['outs'][0].shape if len(results[k]['outs']) > 0 else 0}")
     print(f'Total Elapsed: {total_elapsed:.6f} seconds, Average time per segment: {total_elapsed / total_n:.6f} seconds')
 
-    with open(f'{rn}-results.pkl', 'wb') as f:
+    with open(f'{ckpt_name}-results.pkl', 'wb') as f:
         pickle.dump(results, f)
 
 
@@ -403,10 +426,6 @@ def main():
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.cfg)
-
-    if args.training:
-        print('-----Training-----')
-        test(cfg, train=True)
         
     print('-----Testing-----')
     test(cfg, train=False)

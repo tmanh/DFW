@@ -4,13 +4,11 @@ import argparse
 import time
 
 import torch
-import torch.nn as nn
-import torch.optim as optim
 
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.signal import medfilt
 
-from common.utils import instantiate_from_config
 from model.mlp import *
 from sklearn.cluster import KMeans
 
@@ -18,9 +16,11 @@ from dataloader import *
 from torch.utils.data import DataLoader
 
 from omegaconf import OmegaConf
-from tqdm import tqdm
 from torchmetrics.functional import pearson_corrcoef
-from scipy.signal import medfilt
+
+from model.pyked import *
+
+from gstools import Gaussian  # you already use this
 
 
 logging.basicConfig(filename="log-test-all.txt", level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -28,11 +28,9 @@ logging.basicConfig(filename="log-test-all.txt", level=logging.INFO, format="%(a
 
 def plot_graph(o, y, x, idx):
     # Move tensors to CPU and convert to NumPy
-    o_np = o.detach().cpu().numpy().flatten()
-    y_np = y.detach().cpu().numpy().flatten()
-    if len(x.shape) == 3:
-        x = x.squeeze(0)
-    x_np = x.detach().cpu().numpy()
+    o_np = o
+    y_np = y
+    # x_np = x
 
     # Create a time axis
     time_steps = range(len(y_np))
@@ -40,8 +38,8 @@ def plot_graph(o, y, x, idx):
     # Create and save plot
     plt.figure(figsize=(12, 6))
     plt.plot(time_steps, y_np, label='Ground Truth (y)', marker='o')
-    for i in range(x_np.shape[0]):
-        plt.plot(time_steps, x_np[i], label=f'Source ({i})', marker='o')
+    # for i in range(x_np.shape[1]):
+    #     plt.plot(time_steps, x_np[:, i], label=f'Source ({i})', marker='o')
     plt.plot(time_steps, o_np, label='Interpolated (o)', marker='x')
     plt.title('Comparison of Ground Truth and Interpolated Time Series')
     plt.xlabel('Time Step')
@@ -51,7 +49,7 @@ def plot_graph(o, y, x, idx):
     plt.tight_layout()
 
     # Save to file (you can change path/filename as needed)
-    output_path = f'results/{idx}.png'
+    output_path = f'results/{idx}_ked.png'
     plt.savefig(output_path)
     plt.close()
 
@@ -78,7 +76,7 @@ def get_checkpoint_name(cfg):
     return f'model_{mn}.pth'
 
 
-def split_stations_by_clusters(data, n_clusters=25, n_train_clusters=7, random_seed=42):
+def split_stations_by_clusters(data, n_clusters=25, n_train_clusters=13, random_seed=42):
     """
     Splits coordinate-based station data into train and test sets using spatial clustering.
 
@@ -207,189 +205,224 @@ def has_significant_slope(ts, window_size=7, range_thresh=0.2, outlier_threshold
     return False  # No significant local change found
 
 
+# -------------------------------------------------------
+# FULL test() function skeleton with the fast KED segment
+# -------------------------------------------------------
 def test(cfg, train=True):
     if not os.path.exists('data/split.pkl'):
-        with open('data/selected_stats_segment.pkl', 'rb') as f:
+        with open('data/selected_stats_rainfall_segment.pkl', 'rb') as f:
             data = pickle.load(f)
 
         good_nb_extended, test_nb = split_stations_by_clusters(data)
         print('Train length: ', len(good_nb_extended))
         print('Test length: ', len(test_nb))
         with open('data/split.pkl', 'wb') as f:
-            pickle.dump(
-                {'train': good_nb_extended, 'test': test_nb},
-                f
-            )
+            pickle.dump({'train': good_nb_extended, 'test': test_nb}, f)
     else:
         with open('data/split.pkl', 'rb') as f:
             split = pickle.load(f)
             good_nb_extended = split['train']
             test_nb = split['test']
 
-    # 🔹 1️⃣ Define Device (Multi-GPU)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = 'cpu'
-
-    train_dataset = WaterDataset(
-        path='data/selected_stats_rainfall_segment.pkl', train=True,
-        selected_stations=good_nb_extended, input_type=cfg.dataset.inputs
-    )
-    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
-
-    # 🔹 2️⃣ Initialize Model
-    model = instantiate_from_config(cfg.model).to(device)
-    model = model.to(device)
-
-    mse_loss = nn.MSELoss()
-
-    # Training loop
-    num_epochs = 25
-
-    ckpt_name = get_checkpoint_name(cfg=cfg)
-    if train:
-        list_loss = []
-        epoch_bar = tqdm(range(num_epochs), desc="Epochs")  # Initialize tqdm for epochs
-        optimizer = optim.Adam(model.parameters(), lr=0.001)
-        for epoch in epoch_bar:
-            for x, xs, y, kes, lrain, nrain, valid, loc in tqdm(train_loader, desc=f"Training Epoch {epoch+1}", leave=False):
-                x = x.to(device)
-                xs = xs.to(device)
-                y = y.to(device)
-                kes = kes.to(device)
-                valid = valid.to(device)
-                lrain = lrain.to(device)
-                nrain = nrain.to(device)
-
-                # Forward pass
-                o = model(xs, x, lrain, nrain, valid)
-
-                # Compute L1 loss on all elements
-                loss = mse_loss(o, y)
-
-                # Backward pass
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                    
-                # Print loss for every epoch
-                epoch_bar.set_description(f"Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}")
-                list_loss.append(loss.item())
-
-            # Save model checkpoint every 5 epochs
-            torch.save(model.state_dict(), ckpt_name)
-        
-    if ckpt_name is not None:
-        model.load_state_dict(torch.load(ckpt_name), strict=False)
-        model.eval()
-
-    rn = cfg.model['target']
-    test_dataset = WaterDataset(
-        path='data/selected_stats_rainfall_segment.pkl', train=False,
-        selected_stations=test_nb, input_type=cfg.dataset.inputs
+    test_dataset = WaterDatasetYAllStations(
+        path='data/selected_stats_rainfall_segment.pkl',
+        train=False,
+        selected_stations=test_nb,
+        input_type=cfg.dataset.inputs
     )
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+
     results = {
-        k:{
-            'corr': [],
-            'loss': [],
-            'gain': [],
-            'tgts': [],
-            'outs': [],
-        } for k in range(len(list(test_dataset.data.keys())))
+        k: {'corr': [], 'loss': [], 'gain': [], 'tgts': [], 'outs': []}
+        for k in range(len(list(test_dataset.data.keys())))
     }
 
     seg_len = 168
-    total_elapsed = 0
+    total_elapsed = 0.0
     total_n = 0
+
     with torch.no_grad():
-        for idx, (mx, mxs, my, _, mlrain, mnrain, mvalid, loc) in enumerate(test_loader):
-            start = time.time()
+        for idx, (mxs, my, mlrain, mnbxs, mnby, mnrain, loc) in enumerate(test_loader):
             outs = []
             tgts = []
             cors = []
             gain = []
-            for i in range(mx.shape[2] // seg_len):
-                start = time.time()
-                x = mx[:, :, i*seg_len:(i+1)*seg_len].to(device)
-                valid = mvalid[:, :, i*seg_len:(i+1)*seg_len].to(device)
-                xs = mxs.to(device)
-                y = my[:, i*seg_len:(i+1)*seg_len].to(device)
 
-                lrain = mlrain[:, i*seg_len:(i+1)*seg_len].to(device)
-                nrain = mnrain[:, :, i*seg_len:(i+1)*seg_len].to(device)
+            for i in range(my.shape[-1] // seg_len):
+                start_time = time.time()
 
-                loc_vals = y[0].detach().cpu().numpy()
+                # segment slices
+                y = my[:, i*seg_len:(i+1)*seg_len].detach().cpu().numpy()              # (1,Tseg)
+                nby = mnby[:, :, i*seg_len:(i+1)*seg_len]                             # (1,K,Tseg) torch
+                nxs = mnbxs                                                            # (1,K,D) torch
+                xs = mxs                                                               # (1,D) torch
+                lrain = mlrain[:, i*seg_len:(i+1)*seg_len]                             # (1,Tseg) torch
+                nrain = mnrain[:, :, i*seg_len:(i+1)*seg_len]                          # (1,K,Tseg) torch
+
+                loc_vals = np.expand_dims(y[0], axis=-1)[:, 0]
                 if not has_significant_slope(loc_vals):
                     continue
                 delta = abs(np.max(loc_vals) - np.min(loc_vals))
                 if delta <= 0.3:
                     continue
 
-                o = model(xs, x, lrain, nrain, valid)
+                # ------------------------------------------------------------
+                # Build xs_like for the new gstools-based KED function:
+                # expects xs with x,y in columns 1,2 (like your OK helper).
+                # We construct: (1,K,3) = [dummy_id, x, y]
+                # Here we assume mnbxs contains coords in first 2 dims (x,y).
+                # If your coord columns differ, change xcoord/ycoord mapping.
+                # ------------------------------------------------------------
+                nxs_np = nxs.detach().cpu().numpy()  # (1,K,D)
+                K, D = nxs_np[0].shape
+                if D < 2:
+                    xcoord = nxs_np[0][:, 0]
+                    ycoord = np.zeros_like(xcoord)
+                else:
+                    xcoord = nxs_np[0][:, 0]
+                    ycoord = nxs_np[0][:, 1]
 
-                elapsed = time.time() - start
-                total_elapsed += elapsed
+                xs_like = np.zeros((1, K, 3), dtype=np.float32)
+                xs_like[0, :, 0] = np.arange(K, dtype=np.float32)
+                xs_like[0, :, 1] = xcoord.astype(np.float32)
+                xs_like[0, :, 2] = ycoord.astype(np.float32)
+                xs_like = torch.tensor(xs_like, device=mxs.device)
+
+                # target xy (virtual station)
+                xs_np = xs.detach().cpu().numpy()
+                if xs_np.ndim == 3 and xs_np.shape[0] == 1:
+                    xs_np = xs_np[0]  # (1,D)
+                if xs_np.ndim == 2 and xs_np.shape[0] == 1 and xs_np.shape[1] >= 2:
+                    target_xy = (float(xs_np[0, 0]), float(xs_np[0, 1]))
+                elif xs_np.ndim == 2 and xs_np.shape[0] == 1 and xs_np.shape[1] == 1:
+                    target_xy = (float(xs_np[0, 0]), 0.0)
+                else:
+                    target_xy = (0.0, 0.0)
+
+                # ------------------------------------------------------------
+                # GSTools model (same as your original intent; tune if needed)
+                # ------------------------------------------------------------
+                gst_model = Gaussian(dim=2, var=2.0, len_scale=4.0, nugget=0.0)
+
+                # ------------------------------------------------------------
+                # FAST KED (GSTools covariance + drift normalization + fallback)
+                # returns (1, Tseg) torch tensor
+                # ------------------------------------------------------------
+                o_t = fast_ked_time_series_gstools_best(
+                    gst_model=gst_model,
+                    xs=xs_like,
+                    x=nby,
+                    lrain=lrain,
+                    nrain=nrain,
+                    valid=None,              # plug your valid mask here if you have one
+                    target_xy=target_xy,
+                    cond_err="adaptive",
+                    cond_err_alpha=0.10,
+                    eps=1e-10,
+                    drift_norm="zscore",
+                    drift_std_floor=1e-6,
+                    drift_clamp=5.0,
+                    rain_lag=0,
+                    rain_smooth=0,
+                    fallback="idw",
+                    idw_power=1.0,
+                )
+
+                o = o_t.squeeze(0).detach().cpu().numpy().astype(float)  # (Tseg,)
+                yt = y[0].astype(float)
+
+                total_elapsed += time.time() - start_time
                 total_n += 1
 
-                # print(o.shape, x.shape, y.shape)
-                # print(o.shape, x.shape)
-                # exit()
-                # from calflops import calculate_flops
-                # inputs = {}
-                # inputs["xs"] = xs
-                # inputs["x"] = x
-                # # inputs["inputs"] = cfg.dataset.inputs
-                # # inputs["train"] = False
-                # # inputs["stage"] = -1
-                # flops, macs, params = calculate_flops(
-                #     model=model, 
-                #     kwargs=inputs,
-                #     output_as_string=True,
-                #     output_precision=4
-                # )
-                # print("FLOPs:%s  MACs:%s  Params:%s \n" %(flops, macs, params))
-                # # FLOPs:31.872 KFLOPS  MACs:15.744 KMACs  Params:5.442 K 
-                # exit()
-                # o1 = idw(xs, x, inputs=cfg.dataset.inputs, train=False, stage=-1)
+                o = suppress_spike_segments(o)
 
-                o_np = o.flatten().detach().cpu().numpy()
-                y_np = y.flatten().detach().cpu().numpy()
+                outs.extend(o.tolist())
+                tgts.extend(yt.tolist())
+                cors.append(pearson_corrcoef(o, yt))
+                gain.extend((yt - o).tolist())
 
-                outs.extend(
-                    o_np
-                )
-                tgts.extend(
-                    y_np
-                )
-                gain.extend(
-                    (y_np - o_np).tolist()
-                )
-
-                if torch.abs(y).max() > 0.5 and torch.abs(y).max() < 1.0:
-                    plot_graph(o, y, x, f'{loc.numpy()}-{idx}-{i}_{rn}')
+                print(idx)
 
             outs = np.array(outs)
             tgts = np.array(tgts)
             if outs.shape[0] > 0:
                 se = (outs - tgts) ** 2
-                cor = pearson_corrcoef(
-                    outs,
-                    tgts
-                )
-
+                cor = pearson_corrcoef(outs, tgts)
                 results[idx]['corr'].append(cor)
                 results[idx]['loss'].append(se)
                 results[idx]['gain'].append(gain)
                 results[idx]['tgts'].append(tgts)
                 results[idx]['outs'].append(outs)
-                results[idx]['loc'] = loc.detach().cpu().numpy()
 
-    for k in results.keys():
-        print(f"Key: {k} - {results[k]['loc'] if 'loc' in results[k] else 'No Location'}, Output: {results[k]['outs'][0].shape if len(results[k]['outs']) > 0 else 0}")
-    print(f'Total Elapsed: {total_elapsed:.6f} seconds, Average time per segment: {total_elapsed / total_n:.6f} seconds')
+    print(f'Total Elapsed: {total_elapsed:.6f} seconds, Average time per segment: {total_elapsed / max(total_n,1):.6f} seconds')
 
-    with open(f'{rn}-results.pkl', 'wb') as f:
+    ckpt_name = 'model.nngp.FAST_GSTOOLS_KED.pkl'
+    with open(f'{ckpt_name}-results.pkl', 'wb') as f:
         pickle.dump(results, f)
+
+
+def suppress_spike_segments(
+    signal,
+    z_thresh=6.0,
+    max_segment_len=8,
+    context=5
+):
+    """
+    Suppress short contiguous spike segments using local median.
+
+    Parameters
+    ----------
+    signal : 1D np.ndarray
+    z_thresh : float
+        MAD-based outlier threshold
+    max_segment_len : int
+        Maximum length of spike segment to correct
+    context : int
+        Number of neighbors on each side for median replacement
+
+    Returns
+    -------
+    filtered : np.ndarray
+    """
+    x = signal.copy()
+    n = len(x)
+
+    # Robust stats
+    med = np.median(x)
+    mad = np.median(np.abs(x - med)) + 1e-8
+    z = np.abs(x - med) / mad
+
+    is_outlier = z > z_thresh
+
+    i = 0
+    while i < n:
+        if not is_outlier[i]:
+            i += 1
+            continue
+
+        # Find contiguous segment
+        start = i
+        while i < n and is_outlier[i]:
+            i += 1
+        end = i  # [start, end)
+
+        seg_len = end - start
+
+        # Only fix *short* pathological bursts
+        if seg_len <= max_segment_len:
+            left = max(0, start - context)
+            right = min(n, end + context)
+
+            neighborhood = np.concatenate([
+                x[left:start],
+                x[end:right]
+            ])
+
+            if len(neighborhood) > 0:
+                replacement = np.median(neighborhood)
+                x[start:end] = replacement
+
+    return x
 
 
 def main():
@@ -404,10 +437,6 @@ def main():
 
     cfg = OmegaConf.load(args.cfg)
 
-    if args.training:
-        print('-----Training-----')
-        test(cfg, train=True)
-        
     print('-----Testing-----')
     test(cfg, train=False)
 

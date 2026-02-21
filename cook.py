@@ -9,8 +9,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.signal import medfilt
 
-from sklearn.gaussian_process.kernels import RBF
-
 from model.mlp import *
 from sklearn.cluster import KMeans
 
@@ -18,10 +16,9 @@ from dataloader import *
 from torch.utils.data import DataLoader
 
 from omegaconf import OmegaConf
-from tqdm import tqdm
 from torchmetrics.functional import pearson_corrcoef
 
-from model.cokriging import OrdinaryCokriging
+from model.cokriging import *
 
 
 logging.basicConfig(filename="log-test-all.txt", level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -215,10 +212,7 @@ def test(cfg, train=True):
         print('Train length: ', len(good_nb_extended))
         print('Test length: ', len(test_nb))
         with open('data/split.pkl', 'wb') as f:
-            pickle.dump(
-                {'train': good_nb_extended, 'test': test_nb},
-                f
-            )
+            pickle.dump({'train': good_nb_extended, 'test': test_nb}, f)
     else:
         with open('data/split.pkl', 'rb') as f:
             split = pickle.load(f)
@@ -226,122 +220,133 @@ def test(cfg, train=True):
             test_nb = split['test']
 
     test_dataset = WaterDatasetYAllStations(
-        path='data/selected_stats_rainfall_segment.pkl', train=False,
-        selected_stations=test_nb, input_type=cfg.dataset.inputs
+        path='data/selected_stats_rainfall_segment.pkl',
+        train=False,
+        selected_stations=test_nb,
+        input_type=cfg.dataset.inputs
     )
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+
     results = {
-        k:{
-            'corr': [],
-            'loss': [],
-            'gain': [],
-            'tgts': [],
-            'outs': []
-        } for k in range(len(list(test_dataset.data.keys())))
+        k: {'corr': [], 'loss': [], 'gain': [], 'tgts': [], 'outs': []}
+        for k in range(len(list(test_dataset.data.keys())))
     }
-
-    # Define variogram models
-    variogram_models = {
-        'var0': ('exponential', {'sill': 80.0, 'range': 35.0, 'nugget': 4.0}),
-        'var1': ('exponential', {'sill': 60.0, 'range': 30.0, 'nugget': 3.0}),
-        'cross_01': ('exponential', {'sill': 50.0, 'range': 32.0, 'nugget': 2.0})
-    }
-
-    model = OrdinaryCokriging(variogram_models=variogram_models, n_variables=2)
 
     seg_len = 168
-    total_elapsed = 0
+    total_elapsed = 0.0
     total_n = 0
+
+    # --------- OKCK hyperparams (tune!) ----------
+    okck_params = dict(
+        corr_model="gaussian",
+        range_=4.0,
+        sill1=2.0,        # primary sill
+        sill2=1.0,        # secondary sill
+        r12=0.5,          # cross-corr (-1..1)  IMPORTANT
+        nugget1=0.0,
+        nugget2=0.0,
+        eps=1e-10,
+        use_collocated_secondary=True,  # uses lrain at target as an extra secondary point
+    )
+
     with torch.no_grad():
         for idx, (mxs, my, mlrain, mnbxs, mnby, mnrain, loc) in enumerate(test_loader):
             outs = []
             tgts = []
             cors = []
             gain = []
+
             for i in range(my.shape[-1] // seg_len):
                 start_time = time.time()
-                y = my[:, i*seg_len:(i+1)*seg_len].detach().cpu().numpy()
-                nby = mnby[:, :, i*seg_len:(i+1)*seg_len].detach().cpu().numpy()
-                nxs = mnbxs.detach().cpu().numpy()
-                xs = mxs.detach().cpu().numpy()
-                lrain = mlrain[:, i*seg_len:(i+1)*seg_len].detach().cpu().numpy()
-                nrain = mnrain[:, :, i*seg_len:(i+1)*seg_len].detach().cpu().numpy()
 
-                if not has_significant_slope(np.expand_dims(y[0], axis=-1)[:, 0]):
+                # segment slices (torch)
+                y = my[:, i*seg_len:(i+1)*seg_len]                    # (1,Tseg)
+                nby = mnby[:, :, i*seg_len:(i+1)*seg_len]            # (1,K,Tseg)
+                nxs = mnbxs                                           # (1,K,D)
+                xs = mxs                                              # (1,D)
+                lrain = mlrain[:, i*seg_len:(i+1)*seg_len]            # (1,Tseg)
+                nrain = mnrain[:, :, i*seg_len:(i+1)*seg_len]         # (1,K,Tseg)
+
+                y_np = y.detach().cpu().numpy()  # (1,Tseg)
+
+                loc_vals = np.expand_dims(y_np[0], axis=-1)[:, 0]
+                if not has_significant_slope(loc_vals):
+                    continue
+                delta = abs(np.max(loc_vals) - np.min(loc_vals))
+                if delta <= 0.3:
                     continue
 
-                o = np.zeros((1, y.shape[1]))
-                for tidx in range(y.shape[1]):
-                    model.fit(
-                        X_list=[nxs[0], nxs[0]],                    # station coordinates
-                        y_list=[nby[0, :, tidx], nrain[0, :, tidx]] # water level and precipitation
-                    )
+                # --------- coords (EDIT if your coord columns differ) ----------
+                nxs_np = nxs.detach().cpu().numpy()   # (1,K,Dfeat)
+                xs_np = xs.detach().cpu().numpy()     # (1,Dfeat)
 
-                    o[0, tidx] = model.predict(
-                        X_pred=[xs[0]],  # target station coordinate
-                    )[0]
+                K, Dfeat = nxs_np[0].shape
+                if Dfeat < 2:
+                    xcoord = nxs_np[0][:, 0]
+                    ycoord = np.zeros_like(xcoord)
+                    target_xy = np.array([float(xs_np[0, 0]), 0.0], dtype=float)
+                else:
+                    xcoord = nxs_np[0][:, 0]
+                    ycoord = nxs_np[0][:, 1]
+                    target_xy = np.array([float(xs_np[0, 0]), float(xs_np[0, 1])], dtype=float)
+
+                # neighbor coords (K,2)
+                nxy = np.column_stack([xcoord, ycoord]).astype(np.float64)
+
+                # values (numpy)
+                nby_np = nby[0].detach().cpu().numpy().astype(np.float64)    # (K,Tseg)
+                nrain_np = nrain[0].detach().cpu().numpy().astype(np.float64)# (K,Tseg)
+                lrain_np = lrain[0].detach().cpu().numpy().astype(np.float64)# (Tseg,)
+
+                # --------- OKCK prediction for this segment ----------
+                try:
+                    pred_ts = fast_okck_time_series(
+                        nxs=nxy,
+                        xs=target_xy,
+                        nby=nby_np,
+                        nrain=nrain_np,
+                        lrain=lrain_np,
+                        **okck_params
+                    )
+                except Exception:
+                    # fallback: IDW (same as your typical fallback)
+                    # weights ~ 1 / dist
+                    tx, ty = float(target_xy[0]), float(target_xy[1])
+                    d = np.sqrt((nxy[:, 0] - tx)**2 + (nxy[:, 1] - ty)**2)
+                    d = np.maximum(d, 1e-12)
+                    w = 1.0 / d
+                    w = w / (np.sum(w) + 1e-12)
+                    pred_ts = w @ nby_np  # (Tseg,)
+
+                o = pred_ts.reshape(1, -1).astype(float)  # (1,Tseg)
+                y_seg = y_np.astype(float)
 
                 total_elapsed += time.time() - start_time
                 total_n += 1
 
-                # print(o.shape, x.shape, y.shape)
-                # print(o.shape, x.shape)
-                # exit()
-                # from calflops import calculate_flops
-                # inputs = {}
-                # inputs["xs"] = xs
-                # inputs["x"] = x
-                # # inputs["inputs"] = cfg.dataset.inputs
-                # # inputs["train"] = False
-                # # inputs["stage"] = -1
-                # flops, macs, params = calculate_flops(
-                #     model=model, 
-                #     kwargs=inputs,
-                #     output_as_string=True,
-                #     output_precision=4
-                # )
-                # print("FLOPs:%s  MACs:%s  Params:%s \n" %(flops, macs, params))
-                # # FLOPs:31.872 KFLOPS  MACs:15.744 KMACs  Params:5.442 K 
-                # exit()
-                # o1 = idw(xs, x, inputs=cfg.dataset.inputs, train=False, stage=-1)
+                # post-process
+                o1 = suppress_spike_segments(o.flatten())
+                y1 = y_seg.flatten()
 
-                o = o.flatten()
-                y = y.flatten()
+                outs.extend(o1.tolist())
+                tgts.extend(y1.tolist())
+                cors.append(pearson_corrcoef(o1, y1))
+                gain.extend((y1 - o1).tolist())
 
-                o = suppress_spike_segments(o)
-
-                outs.extend(
-                    o
-                )
-                tgts.extend(
-                    y
-                )
-                cors.append(
-                    pearson_corrcoef(
-                        o,
-                        y
-                    )
-                )
-                gain.extend(
-                    (y - o).tolist()
-                )
-                plot_graph(o, y, nby, f'{loc.numpy()}-{idx}-{i}')
+                print(idx)
 
             outs = np.array(outs)
             tgts = np.array(tgts)
             if outs.shape[0] > 0:
                 se = (outs - tgts) ** 2
-                cor = pearson_corrcoef(
-                    outs,
-                    tgts
-                )
+                cor = pearson_corrcoef(outs, tgts)
                 results[idx]['corr'].append(cor)
                 results[idx]['loss'].append(se)
                 results[idx]['gain'].append(gain)
                 results[idx]['tgts'].append(tgts)
                 results[idx]['outs'].append(outs)
 
-    print(f'Total Elapsed: {total_elapsed:.6f} seconds, Average time per segment: {total_elapsed / total_n:.6f} seconds')
+    print(f"Total Elapsed: {total_elapsed:.6f} seconds, Average time per segment: {total_elapsed / max(total_n,1):.6f} seconds")
 
     ckpt_name = 'model.nngp.CoKriging.pkl'
     with open(f'{ckpt_name}-results.pkl', 'wb') as f:

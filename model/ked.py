@@ -1,420 +1,300 @@
-"""
-Kriging with External Drift (KED) Implementation
-================================================
-This module implements Kriging with External Drift for spatial interpolation
-using auxiliary/external variables to improve predictions.
-"""
-
 import numpy as np
 from scipy.spatial.distance import cdist
-from scipy.linalg import solve
-import matplotlib.pyplot as plt
+from scipy.linalg import cho_factor, cho_solve
 from typing import Tuple, Optional, Callable
+
+
+def _solve_ked_block(C, F, c, f0, eps=1e-8):
+    """
+    Solve:
+        [C  F] [w] = [c]
+        [F' 0] [λ]   [f0]
+    using Schur complement; needs C SPD.
+
+    C: (n,n) SPD
+    F: (n,q)
+    c: (n,)   covariance between pred and training
+    f0:(q,)   drift basis at pred
+    returns w (n,), lam (q,)
+    """
+    n = C.shape[0]
+    q = F.shape[1]
+
+    # Cholesky on C (SPD). Add diagonal eps if needed.
+    C_reg = C + eps * np.eye(n)
+    cf = cho_factor(C_reg, lower=True, check_finite=False)
+
+    # Compute C^{-1}F and C^{-1}c
+    CiF = cho_solve(cf, F, check_finite=False)      # (n,q)
+    Cic = cho_solve(cf, c.reshape(-1,1), check_finite=False).reshape(-1)  # (n,)
+
+    # Schur complement: S = F' C^{-1} F (q,q)
+    S = F.T @ CiF
+
+    # rhs for lambda: F' C^{-1} c - f0
+    rhs = F.T @ Cic - f0
+
+    # Solve S λ = rhs (S should be SPD if F has full column rank)
+    # Add tiny ridge for numerical stability
+    S_reg = S + eps * np.eye(q)
+    lam = np.linalg.solve(S_reg, rhs)
+
+    # w = C^{-1}(c - F λ)
+    w = Cic - CiF @ lam
+    return w, lam
+
+
+def _ked_variance(C00, w, c, lam, f0):
+    # σ^2 = C00 - w'c + λ'f0
+    return float(C00 - (w @ c) + (lam @ f0))
 
 
 class KrigingExternalDrift:
     """
-    Kriging with External Drift (KED) implementation.
-    
-    KED extends ordinary kriging by incorporating external drift variables
-    that are correlated with the primary variable of interest.
-    
-    Parameters
-    ----------
-    variogram_model : str or callable
-        Variogram model type: 'spherical', 'exponential', 'gaussian', or custom function
-    variogram_params : dict
-        Parameters for the variogram model (e.g., {'sill': 1.0, 'range': 10.0, 'nugget': 0.1})
+    Kriging with External Drift (KED) / Universal Kriging with external covariates.
+
+    Uses covariance formulation:
+        [ C   F ] [ w ] = [ c ]
+        [ F'  0 ] [ λ ]   [ f0]
+    Prediction:
+        yhat = w' y
+    Variance:
+        s2 = C(0) - w' c + λ' f0
     """
-    
-    def __init__(self, variogram_model: str = 'spherical', 
-                 variogram_params: Optional[dict] = None):
+
+    def __init__(
+        self,
+        variogram_model: str = "spherical",
+        variogram_params: Optional[dict] = None,
+        eps: float = 1e-8,
+    ):
         self.variogram_model = variogram_model
-        self.variogram_params = variogram_params or {'sill': 1.0, 'range': 10.0, 'nugget': 0.0}
-        
-        # Fitted data
+        self.variogram_params = variogram_params or {"sill": 1.0, "range": 10.0, "nugget": 0.0}
+        self.eps = float(eps)
+
         self.X_train = None
         self.y_train = None
         self.drift_train = None
         self.n_samples = None
         self.n_drift = None
-        
+
+    # -----------------------
+    # Variogram & Covariance
+    # -----------------------
+
     def _variogram(self, h: np.ndarray) -> np.ndarray:
-        """
-        Calculate variogram value for distance h.
-        
-        Parameters
-        ----------
-        h : np.ndarray
-            Distance array
-            
-        Returns
-        -------
-        gamma : np.ndarray
-            Variogram values
-        """
-        sill = self.variogram_params.get('sill', 1.0)
-        range_ = self.variogram_params.get('range', 10.0)
-        nugget = self.variogram_params.get('nugget', 0.0)
-        
+        sill = float(self.variogram_params.get("sill", 1.0))
+        range_ = float(self.variogram_params.get("range", 10.0))
+        nugget = float(self.variogram_params.get("nugget", 0.0))
+
         if callable(self.variogram_model):
             return self.variogram_model(h, **self.variogram_params)
-        
-        if self.variogram_model == 'spherical':
-            gamma = np.where(
-                h <= range_,
-                nugget + (sill - nugget) * (1.5 * h / range_ - 0.5 * (h / range_) ** 3),
-                sill
-            )
-        elif self.variogram_model == 'exponential':
-            gamma = nugget + (sill - nugget) * (1 - np.exp(-3 * h / range_))
-        elif self.variogram_model == 'gaussian':
-            gamma = nugget + (sill - nugget) * (1 - np.exp(-3 * (h / range_) ** 2))
-        else:
-            raise ValueError(f"Unknown variogram model: {self.variogram_model}")
-        
-        return gamma
-    
-    def fit(self, X: np.ndarray, y: np.ndarray, drift: np.ndarray) -> 'KrigingExternalDrift':
-        """
-        Fit the KED model with training data.
-        
-        Parameters
-        ----------
-        X : np.ndarray, shape (n_samples, n_features)
-            Coordinates of known points (e.g., [longitude, latitude])
-        y : np.ndarray, shape (n_samples,)
-            Values at known points (primary variable)
-        drift : np.ndarray, shape (n_samples,) or (n_samples, n_drift_vars)
-            External drift variables at known points
-            
-        Returns
-        -------
-        self : KrigingExternalDrift
-            Fitted model
-        """
-        self.X_train = np.array(X)
-        self.y_train = np.array(y)
-        
-        # Ensure drift is 2D
-        drift_array = np.atleast_1d(drift)
-        if drift_array.ndim == 1:
-            self.drift_train = drift_array.reshape(-1, 1)
-        else:
-            self.drift_train = drift_array
-        
-        self.n_samples = len(y)
-        self.n_drift = self.drift_train.shape[1]
-        
-        return self
-    
-    def _build_kriging_matrix(self, X_pred: np.ndarray, drift_pred: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Build the kriging system matrices for prediction.
-        
-        Parameters
-        ----------
-        X_pred : np.ndarray, shape (n_pred, n_features)
-            Coordinates where predictions are needed
-        drift_pred : np.ndarray, shape (n_pred, n_drift_vars)
-            External drift values at prediction points
-            
-        Returns
-        -------
-        A : np.ndarray
-            Left-hand side kriging matrix
-        b : np.ndarray
-            Right-hand side kriging matrix
-        """
-        n_pred = X_pred.shape[0]
-        
-        # Calculate distances between training points
-        dist_train = cdist(self.X_train, self.X_train)
-        gamma_train = self._variogram(dist_train)
-        
-        # Build the kriging matrix A
-        # Structure:
-        # | Gamma    F     |
-        # | F^T      0     |
-        # where F contains drift variables and constant term (1s)
-        
-        A_size = self.n_samples + self.n_drift + 1
-        A = np.zeros((A_size, A_size))
-        
-        # Fill variogram part
-        A[:self.n_samples, :self.n_samples] = gamma_train
-        
-        # Fill drift part
-        A[:self.n_samples, self.n_samples] = 1  # constant drift
-        A[self.n_samples, :self.n_samples] = 1
-        
-        for i in range(self.n_drift):
-            A[:self.n_samples, self.n_samples + 1 + i] = self.drift_train[:, i]
-            A[self.n_samples + 1 + i, :self.n_samples] = self.drift_train[:, i]
-        
-        # Build right-hand side b for each prediction point
-        b = np.zeros((n_pred, A_size))
-        
-        dist_pred = cdist(X_pred, self.X_train)
-        gamma_pred = self._variogram(dist_pred)
-        
-        b[:, :self.n_samples] = gamma_pred
-        b[:, self.n_samples] = 1  # constant drift
-        
-        # Handle drift prediction values
-        drift_pred_array = np.atleast_1d(drift_pred)
-        if drift_pred_array.ndim == 1:
-            drift_pred_array = drift_pred_array.reshape(-1, 1)
-        
-        if drift_pred_array.shape[0] != n_pred:
-            drift_pred_array = drift_pred_array.T
-        
-        for i in range(self.n_drift):
-            b[:, self.n_samples + 1 + i] = drift_pred_array[:, i]
-        
-        eps = 1e-6
-        A[:self.n_samples, :self.n_samples] += eps * np.eye(self.n_samples)
 
-        return A, b
-    
-    def predict(self, X_pred: np.ndarray, drift_pred: np.ndarray, 
-                return_std: bool = False) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        if self.variogram_model == "spherical":
+            # semivariogram; often gamma(0)=0 and nugget is a discontinuity;
+            # here we keep gamma(0)=0 and represent nugget in covariance diagonal.
+            hr = np.clip(h / range_, 0.0, 1.0)
+            core = 1.5 * hr - 0.5 * hr**3
+            gamma = (sill - nugget) * np.where(h <= range_, core, 1.0)
+            # Do NOT add nugget here; handle nugget in covariance diagonal.
+            return gamma
+
+        if self.variogram_model == "exponential":
+            return (sill - nugget) * (1.0 - np.exp(-3.0 * h / range_))
+
+        if self.variogram_model == "gaussian":
+            return (sill - nugget) * (1.0 - np.exp(-3.0 * (h / range_) ** 2))
+
+        raise ValueError(f"Unknown variogram model: {self.variogram_model}")
+
+    def _covariance(self, h: np.ndarray, add_nugget_on_diag: bool = False) -> np.ndarray:
         """
-        Predict values at new locations using KED.
-        
-        Parameters
-        ----------
-        X_pred : np.ndarray, shape (n_pred, n_features)
-            Coordinates where predictions are needed
-        drift_pred : np.ndarray, shape (n_pred, n_drift_vars)
-            External drift values at prediction points
-        return_std : bool, default=False
-            Whether to return kriging standard deviation
-            
-        Returns
-        -------
-        y_pred : np.ndarray, shape (n_pred,)
-            Predicted values
-        sigma : np.ndarray, shape (n_pred,), optional
-            Kriging standard deviation (if return_std=True)
+        Convert variogram model to covariance:
+            C(h) = (sill - nugget) - gamma(h)   for h>0
+            C(0) = sill
+        Nugget is handled as diagonal-only term if add_nugget_on_diag=True.
+        """
+        sill = float(self.variogram_params.get("sill", 1.0))
+        nugget = float(self.variogram_params.get("nugget", 0.0))
+
+        gamma = self._variogram(h)
+        C = (sill - nugget) - gamma
+
+        # enforce C(0)=sill on exact zeros (numerical)
+        if np.ndim(h) > 0:
+            C = np.array(C, dtype=float, copy=True)
+            C[h == 0] = sill - nugget  # base covariance without nugget
+        else:
+            C = float(C)
+            if h == 0:
+                C = sill - nugget
+
+        if add_nugget_on_diag:
+            # nugget as measurement error / microscale on diagonal
+            if C.ndim == 2:
+                C = C + nugget * np.eye(C.shape[0])
+            else:
+                # scalar variance at a point includes nugget
+                C = C + nugget
+
+        return C
+
+    # -----------------------
+    # Fit
+    # -----------------------
+
+    def fit(self, X: np.ndarray, y: np.ndarray, drift: np.ndarray) -> "KrigingExternalDrift":
+        self.X_train = np.asarray(X, float)
+        self.y_train = np.asarray(y, float).reshape(-1)
+
+        drift_array = np.asarray(drift, float)
+        if drift_array.ndim == 1:
+            drift_array = drift_array.reshape(-1, 1)
+        self.drift_train = drift_array
+
+        self.n_samples = self.y_train.shape[0]
+        self.n_drift = self.drift_train.shape[1]
+
+        if self.X_train.shape[0] != self.n_samples:
+            raise ValueError("X and y must have same number of samples")
+        if self.drift_train.shape[0] != self.n_samples:
+            raise ValueError("drift and y must have same number of samples")
+
+        return self
+
+    # -----------------------
+    # Build system (cov form)
+    # -----------------------
+
+    def _build_system(
+        self,
+        X_pred: np.ndarray,
+        drift_pred: np.ndarray,
+        nmax: Optional[int] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Returns:
+          A: (M,M) system matrix
+          rhs: (M, n_pred) RHS matrix (each column is rhs for a pred point)
+          idx_sets: (n_pred, n_used) indices used per pred (or None if global)
+          f0_all: (n_pred, q) drift basis at pred points
         """
         if self.X_train is None:
             raise ValueError("Model must be fitted before prediction")
-        
-        X_pred = np.atleast_2d(X_pred)
-        
-        # Build kriging system
-        A, b = self._build_kriging_matrix(X_pred, drift_pred)
-        
-        # Solve kriging system for weights
-        weights = _solve_kriging(A, b)
-        
-        # Calculate predictions
-        y_pred = weights[:, :self.n_samples] @ self.y_train
-        
-        if return_std:
-            # Calculate kriging variance
-            sigma_squared = np.sum(weights * b, axis=1)
-            sigma = np.sqrt(np.maximum(sigma_squared, 0))  # Ensure non-negative
-            return y_pred, sigma
-        
-        return y_pred, None
 
+        X_pred = np.asarray(X_pred, float)
+        if X_pred.ndim == 1:
+            X_pred = X_pred.reshape(1, -1)
 
-# Example usage and demonstration
-def example_1d():
-    """Simple 1D example with synthetic data"""
-    print("=" * 60)
-    print("Example 1: 1D Kriging with External Drift")
-    print("=" * 60)
-    
-    # Generate synthetic data
-    np.random.seed(42)
-    n_train = 20
-    
-    # Training points
-    X_train = np.linspace(0, 100, n_train).reshape(-1, 1)
-    
-    # External drift (e.g., elevation, temperature)
-    drift_train = 0.5 * X_train.ravel() + 10 * np.sin(X_train.ravel() / 20)
-    
-    # Primary variable (correlated with drift + spatial variation)
-    y_train = (2 * drift_train + 
-               5 * np.sin(X_train.ravel() / 10) + 
-               np.random.normal(0, 2, n_train))
-    
-    # Prediction points
-    X_pred = np.linspace(0, 100, 200).reshape(-1, 1)
-    drift_pred = 0.5 * X_pred.ravel() + 10 * np.sin(X_pred.ravel() / 20)
-    
-    # Fit KED model
-    ked = KrigingExternalDrift(
-        variogram_model='spherical',
-        variogram_params={'sill': 50.0, 'range': 30.0, 'nugget': 2.0}
-    )
-    ked.fit(X_train, y_train, drift_train)
-    
+        drift_pred = np.asarray(drift_pred, float)
+        if drift_pred.ndim == 1:
+            drift_pred = drift_pred.reshape(-1, 1)
+        if drift_pred.shape[0] != X_pred.shape[0]:
+            # allow transpose if user passed (q, n_pred)
+            if drift_pred.shape[1] == X_pred.shape[0]:
+                drift_pred = drift_pred.T
+            else:
+                raise ValueError("drift_pred must align with X_pred rows")
+
+        n_pred = X_pred.shape[0]
+
+        # Build drift basis: [1, drift_vars...]
+        F_train = np.column_stack([np.ones(self.n_samples), self.drift_train])  # (n, q)
+        f0_all = np.column_stack([np.ones(n_pred), drift_pred])                 # (n_pred, q)
+        q = F_train.shape[1]
+
+        # Global system (all points) or local per pred
+        if nmax is None or nmax >= self.n_samples:
+            # distances among training points
+            D = cdist(self.X_train, self.X_train)
+            C = self._covariance(D, add_nugget_on_diag=True)  # include nugget on diag
+            C = C + self.eps * np.eye(self.n_samples)
+
+            # system A
+            M = self.n_samples + q
+            A = np.zeros((M, M), float)
+            A[:self.n_samples, :self.n_samples] = C
+            A[:self.n_samples, self.n_samples:] = F_train
+            A[self.n_samples:, :self.n_samples] = F_train.T
+            # bottom-right is zeros
+
+            # RHS for all pred: [c; f0]
+            Dp = cdist(X_pred, self.X_train)                         # (n_pred, n)
+            c = self._covariance(Dp, add_nugget_on_diag=False)        # (n_pred, n)
+            rhs = np.zeros((M, n_pred), float)
+            rhs[:self.n_samples, :] = c.T
+            rhs[self.n_samples:, :] = f0_all.T
+
+            return A, rhs, None, f0_all
+
+        # Local KED: build per prediction point (nearest nmax)
+        # We return a dummy A/rhs; prediction will handle per-point
+        return None, None, None, f0_all
+
+    # -----------------------
     # Predict
-    y_pred, sigma = ked.predict(X_pred, drift_pred, return_std=True)
-    
-    # Plot results
-    plt.figure(figsize=(12, 5))
-    
-    plt.subplot(1, 2, 1)
-    plt.scatter(X_train, y_train, c='red', s=50, label='Training data', zorder=3)
-    plt.plot(X_pred, y_pred, 'b-', label='KED prediction', linewidth=2)
-    plt.fill_between(X_pred.ravel(), 
-                     y_pred - 2*sigma, 
-                     y_pred + 2*sigma, 
-                     alpha=0.3, label='±2σ confidence')
-    plt.xlabel('Location')
-    plt.ylabel('Value')
-    plt.title('Kriging with External Drift - Predictions')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    
-    plt.subplot(1, 2, 2)
-    plt.scatter(X_train, drift_train, c='green', s=50, label='Training drift', zorder=3)
-    plt.plot(X_pred, drift_pred, 'g-', label='Prediction drift', linewidth=2)
-    plt.xlabel('Location')
-    plt.ylabel('Drift value')
-    plt.title('External Drift Variable')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig('/mnt/user-data/outputs/ked_1d_example.png', dpi=150, bbox_inches='tight')
-    print("✓ 1D example plot saved")
-    
-    return ked, y_pred, sigma
+    # -----------------------
 
+    def predict(
+        self,
+        X_pred: np.ndarray,
+        drift_pred: np.ndarray,
+        return_std: bool = False,
+        nmax: Optional[int] = None,
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """
+        nmax: if set, use only the nearest nmax training points for each prediction point.
+        """
+        if self.X_train is None:
+            raise ValueError("Model must be fitted before prediction")
 
-def example_2d():
-    """2D spatial example"""
-    print("\n" + "=" * 60)
-    print("Example 2: 2D Kriging with External Drift")
-    print("=" * 60)
-    
-    # Generate 2D synthetic data
-    np.random.seed(42)
-    n_train = 50
-    
-    # Random training locations
-    X_train = np.random.uniform(0, 100, (n_train, 2))
-    
-    # External drift (e.g., elevation)
-    drift_train = (0.3 * X_train[:, 0] + 
-                   0.2 * X_train[:, 1] + 
-                   10 * np.sin(X_train[:, 0] / 20))
-    
-    # Primary variable (e.g., soil moisture, temperature)
-    y_train = (1.5 * drift_train + 
-               10 * np.sin(X_train[:, 0] / 15) * np.cos(X_train[:, 1] / 15) +
-               np.random.normal(0, 3, n_train))
-    
-    # Create prediction grid
-    x_grid = np.linspace(0, 100, 50)
-    y_grid = np.linspace(0, 100, 50)
-    X_grid, Y_grid = np.meshgrid(x_grid, y_grid)
-    X_pred = np.column_stack([X_grid.ravel(), Y_grid.ravel()])
-    
-    drift_pred = (0.3 * X_pred[:, 0] + 
-                  0.2 * X_pred[:, 1] + 
-                  10 * np.sin(X_pred[:, 0] / 20))
-    
-    # Fit KED model
-    ked = KrigingExternalDrift(
-        variogram_model='exponential',
-        variogram_params={'sill': 100.0, 'range': 40.0, 'nugget': 5.0}
-    )
-    ked.fit(X_train, y_train, drift_train)
-    
-    # Predict
-    y_pred, sigma = ked.predict(X_pred, drift_pred, return_std=True)
-    
-    # Reshape for plotting
-    Z_pred = y_pred.reshape(X_grid.shape)
-    Z_sigma = sigma.reshape(X_grid.shape)
-    
-    # Plot results
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-    
-    # Prediction map
-    im1 = axes[0].contourf(X_grid, Y_grid, Z_pred, levels=20, cmap='viridis')
-    axes[0].scatter(X_train[:, 0], X_train[:, 1], c=y_train, 
-                   s=80, edgecolors='white', linewidth=1.5, cmap='viridis')
-    axes[0].set_xlabel('X coordinate')
-    axes[0].set_ylabel('Y coordinate')
-    axes[0].set_title('KED Predictions')
-    plt.colorbar(im1, ax=axes[0], label='Predicted value')
-    
-    # Uncertainty map
-    im2 = axes[1].contourf(X_grid, Y_grid, Z_sigma, levels=20, cmap='Reds')
-    axes[1].scatter(X_train[:, 0], X_train[:, 1], c='blue', s=50, alpha=0.6)
-    axes[1].set_xlabel('X coordinate')
-    axes[1].set_ylabel('Y coordinate')
-    axes[1].set_title('Prediction Uncertainty (σ)')
-    plt.colorbar(im2, ax=axes[1], label='Standard deviation')
-    
-    # Drift map
-    Z_drift = drift_pred.reshape(X_grid.shape)
-    im3 = axes[2].contourf(X_grid, Y_grid, Z_drift, levels=20, cmap='terrain')
-    axes[2].scatter(X_train[:, 0], X_train[:, 1], c='red', s=50, alpha=0.6)
-    axes[2].set_xlabel('X coordinate')
-    axes[2].set_ylabel('Y coordinate')
-    axes[2].set_title('External Drift Variable')
-    plt.colorbar(im3, ax=axes[2], label='Drift value')
-    
-    plt.tight_layout()
-    plt.savefig('/mnt/user-data/outputs/ked_2d_example.png', dpi=150, bbox_inches='tight')
-    print("✓ 2D example plot saved")
-    
-    return ked, Z_pred, Z_sigma
+        X_pred = np.asarray(X_pred, float)
+        if X_pred.ndim == 1:
+            X_pred = X_pred.reshape(1, -1)
 
+        drift_pred = np.asarray(drift_pred, float)
+        if drift_pred.ndim == 1:
+            drift_pred = drift_pred.reshape(-1, 1)
+        if drift_pred.shape[0] != X_pred.shape[0]:
+            if drift_pred.shape[1] == X_pred.shape[0]:
+                drift_pred = drift_pred.T
+            else:
+                raise ValueError("drift_pred must align with X_pred rows")
 
-def _solve_kriging(A, b):
-    """
-    Solve kriging system with robust fallbacks.
+        n_pred = X_pred.shape[0]
+        yhat = np.zeros(n_pred, float)
+        sigma = np.zeros(n_pred, float) if return_std else None
 
-    Parameters
-    ----------
-    A : ndarray, shape (M, M)
-        Kriging matrix
-    b : ndarray, shape (n_pred, M)
-        RHS matrix (one row per prediction point)
+        # Drift basis
+        F_train = np.column_stack([np.ones(self.n_samples), self.drift_train])  # (n,q)
+        # q = F_train.shape[1]
 
-    Returns
-    -------
-    weights : ndarray, shape (n_pred, M)
-    """
-    B = b.T  # (M, n_pred)
+        # Covariance among training
+        D = cdist(self.X_train, self.X_train)
+        C = self._covariance(D, add_nugget_on_diag=True)
+        C = C + self.eps * np.eye(self.n_samples)
 
-    try:
-        # 1) Exact solve
-        W = solve(A, B)
-    except np.linalg.LinAlgError:
-        try:
-            # 2) Least squares fallback
-            W = np.linalg.lstsq(A, B, rcond=1e-10)[0]
-        except Exception:
-            # 3) Regularized solve (last resort)
-            eps = 1e-6
-            A_reg = A + eps * np.eye(A.shape[0])
-            W = solve(A_reg, B)
+        # For each pred point:
+        Dp = cdist(X_pred, self.X_train)
+        c_all = self._covariance(Dp, add_nugget_on_diag=False)  # (n_pred, n)
+        f0_all = np.column_stack([np.ones(n_pred), drift_pred]) # (n_pred, q)
 
-    return W.T  # (n_pred, M)
+        yhat = np.zeros(n_pred)
+        sigma = np.zeros(n_pred) if return_std else None
 
+        sill = float(self.variogram_params.get("sill", 1.0))
+        C00 = sill  # process variance; if you want observation variance add nugget here
 
-if __name__ == "__main__":
-    print("\nKriging with External Drift - Implementation Demo\n")
-    
-    # Run examples
-    ked_1d, pred_1d, std_1d = example_1d()
-    ked_2d, pred_2d, std_2d = example_2d()
-    
-    print("\n" + "=" * 60)
-    print("All examples completed successfully!")
-    print("Plots saved to outputs directory")
-    print("=" * 60)
+        for i in range(n_pred):
+            c = c_all[i]       # (n,)
+            f0 = f0_all[i]     # (q,)
 
+            w, lam = _solve_ked_block(C, F_train, c, f0, eps=self.eps)
 
+            yhat[i] = float(w @ self.y_train)
+
+            if return_std:
+                s2 = _ked_variance(C00, w, c, lam, f0)
+                sigma[i] = np.sqrt(max(s2, 0.0))
+
+        return yhat, sigma
